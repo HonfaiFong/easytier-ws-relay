@@ -4,6 +4,11 @@ import { RelayRoom } from './worker/relay_room';
 
 export { RelayRoom };
 
+function getWebSocketPath(env) {
+  const configuredPath = env && env.WS_PATH ? String(env.WS_PATH) : 'ws';
+  return configuredPath.startsWith('/') ? configuredPath : `/${configuredPath}`;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -13,7 +18,7 @@ export default {
       return new Response('ok', { status: 200 });
     }
 
-    const wsPath = '/' + env.WS_PATH || '/ws';
+    const wsPath = getWebSocketPath(env);
     if (pathname === wsPath || pathname === wsPath + '/') {
       if (request.headers.get('Upgrade') !== 'websocket') {
         return new Response('Expected WebSocket upgrade', { status: 400 });
