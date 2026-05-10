@@ -7,6 +7,11 @@ import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
 import { getPeerManager } from './core/peer_manager.js';
 import { randomU64String } from './core/crypto.js';
 
+function getWebSocketPath(env) {
+  const configuredPath = env && env.WS_PATH ? String(env.WS_PATH) : 'ws';
+  return configuredPath.startsWith('/') ? configuredPath : `/${configuredPath}`;
+}
+
 export class RelayRoom {
   constructor(state, env) {
     this.state = state;
@@ -15,14 +20,17 @@ export class RelayRoom {
     this.peerManager = getPeerManager();
     this.peerManager.setTypes(this.types);
 
-    // Restore sockets after hibernation to keep metadata
+    // Keep runtime configuration in sync with Cloudflare Worker env bindings.
+    this.peerManager.applyRuntimeEnv?.(env);
+
+    // Restore sockets after hibernation to keep metadata.
     this.state.getWebSockets().forEach((ws) => this._restoreSocket(ws));
   }
 
   async fetch(request) {
     const url = new URL(request.url);
-    const wsPath = '/' + this.env.WS_PATH || '/ws';
-    if (url.pathname !== wsPath) {
+    const wsPath = getWebSocketPath(this.env);
+    if (url.pathname !== wsPath && url.pathname !== wsPath + '/') {
       return new Response('Not found', { status: 404 });
     }
     if (request.headers.get('Upgrade') !== 'websocket') {
@@ -55,6 +63,7 @@ export class RelayRoom {
         console.warn('[ws] unsupported message type', typeof message);
         return;
       }
+
       console.log(`[ws] recv len=${buffer.length}`);
       ws.lastSeen = Date.now();
       const header = parseHeader(buffer);
@@ -62,50 +71,45 @@ export class RelayRoom {
         console.error('[ws] parseHeader failed, raw hex=', buffer.toString('hex'));
         return;
       }
+
       console.log(`[ws] header from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
       const payload = buffer.subarray(HEADER_SIZE);
+
       switch (header.packetType) {
         case PacketType.HandShake:
           console.log(`[ws] -> handleHandshake payload hex=${payload.toString('hex')}`);
           handleHandshake(ws, header, payload, this.types);
           break;
+
         case PacketType.Ping:
           handlePing(ws, header, payload);
           break;
+
         case PacketType.RpcReq:
-          if (header.toPeerId !== PacketType.Invalid && header.toPeerId !== undefined && header.toPeerId !== null && header.toPeerId !== 0 && header.toPeerId !== PacketType.Invalid && header.toPeerId !== undefined && header.toPeerId !== null && header.toPeerId !== 0 && header.toPeerId !== PacketType.Invalid) {
-            // fallthrough handled below; guard keeps eslint quiet
-          }
-          if (header.toPeerId === PacketType.Invalid /* never true */) {
-            // no-op
-          }
-          if (header.toPeerId === undefined || header.toPeerId === null) {
+          if (header.toPeerId === MY_PEER_ID || header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === 0) {
             handleRpcReq(ws, header, payload, this.types);
-            break;
+          } else {
+            console.log(`[ws] -> forward RpcReq from=${header.fromPeerId} to=${header.toPeerId} len=${payload.length}`);
+            handleForwarding(ws, header, buffer, this.types);
           }
-          if (header.toPeerId === MY_PEER_ID) {
-            handleRpcReq(ws, header, payload, this.types);
-            break;
-          }
-          handleForwarding(ws, header, buffer, this.types);
           break;
+
         case PacketType.RpcResp:
-          if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
+          if (header.toPeerId === MY_PEER_ID || header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === 0) {
             handleRpcResp(ws, header, payload, this.types);
-            break;
+          } else {
+            console.log(`[ws] -> forward RpcResp from=${header.fromPeerId} to=${header.toPeerId} len=${payload.length}`);
+            handleForwarding(ws, header, buffer, this.types);
           }
-          // If toPeerId is not MY_PEER_ID, forward to the target peer
-          if (header.packetType !== PacketType.Data) {
-            console.log(`[ws] -> forward RpcResp type=${header.packetType} from=${header.fromPeerId} to=${header.toPeerId} len=${payload.length}`);
-          }
-          handleForwarding(ws, header, buffer, this.types);
           break;
+
         case PacketType.Data:
         default:
           if (header.packetType !== PacketType.Data) {
             console.log(`[ws] -> forward type=${header.packetType} len=${payload.length}`);
           }
           handleForwarding(ws, header, buffer, this.types);
+          break;
       }
     } catch (e) {
       console.error('relay_room message handling error:', e);
@@ -148,7 +152,7 @@ export class RelayRoom {
   _restoreSocket(ws) {
     const meta = ws.deserializeAttachment ? (ws.deserializeAttachment() || {}) : {};
     this._initSocket(ws, meta);
-    
+
     if (ws.peerId && ws.groupKey) {
       this.peerManager.addPeer(ws.peerId, ws);
     }
