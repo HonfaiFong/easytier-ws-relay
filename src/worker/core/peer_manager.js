@@ -73,16 +73,35 @@ export class PeerManager {
     this.routeSessions = new Map(); // groupKey -> peerId -> session state
     this.peerConnVersions = new Map(); // groupKey -> peerId -> version
     this.types = null;
+    this.runtimeEnv = {};
 
     this.allowVirtualIP = false;
-    this.ipConfiguredByEnv = !!process.env.EASYTIER_IPV4_ADDR;
-    this.netConfiguredByEnv = process.env.EASYTIER_NETWORK_LENGTH !== undefined;
+    this.ipConfiguredByEnv = !!this.getEnv('EASYTIER_IPV4_ADDR');
+    this.netConfiguredByEnv = this.getEnv('EASYTIER_NETWORK_LENGTH') !== undefined;
     this.ipAutoAssigned = false;
     this.myInfo = null; // lazily initialized to avoid random in global scope
-    this.sessionTtlMs = Number(process.env.EASYTIER_SESSION_TTL_MS || 3 * 60 * 1000);
+    this.sessionTtlMs = Number(this.getEnv('EASYTIER_SESSION_TTL_MS', 3 * 60 * 1000));
     this.lastSessionCleanup = 0;
 
-    this.pureP2PMode = (process.env.EASYTIER_DISABLE_RELAY === '1');
+    this.pureP2PMode = (this.getEnv('EASYTIER_DISABLE_RELAY') === '1');
+  }
+
+  getEnv(name, fallback = undefined) {
+    if (this.runtimeEnv && this.runtimeEnv[name] !== undefined && this.runtimeEnv[name] !== null) {
+      return this.runtimeEnv[name];
+    }
+    if (typeof process !== 'undefined' && process.env && process.env[name] !== undefined) {
+      return process.env[name];
+    }
+    return fallback;
+  }
+
+  applyRuntimeEnv(env = {}) {
+    this.runtimeEnv = env || {};
+    this.ipConfiguredByEnv = !!this.getEnv('EASYTIER_IPV4_ADDR');
+    this.netConfiguredByEnv = this.getEnv('EASYTIER_NETWORK_LENGTH') !== undefined;
+    this.sessionTtlMs = Number(this.getEnv('EASYTIER_SESSION_TTL_MS', 3 * 60 * 1000));
+    this.setPureP2PMode(this.getEnv('EASYTIER_DISABLE_RELAY') === '1');
   }
 
   setTypes(types) {
@@ -102,21 +121,21 @@ export class PeerManager {
         kcpInput: false,
         noRelayKcp: false
       },
-      networkLength: Number(process.env.EASYTIER_NETWORK_LENGTH || 24),
-      easytierVersion: process.env.EASYTIER_VERSION || "cf-ws-relay",
+      networkLength: Number(this.getEnv('EASYTIER_NETWORK_LENGTH', 24)),
+      easytierVersion: this.getEnv('EASYTIER_VERSION', "cf-ws-relay"),
       lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
-      hostname: process.env.EASYTIER_HOSTNAME || "PublicServer_WorkerRelay",
+      hostname: this.getEnv('EASYTIER_HOSTNAME', "PublicServer_WorkerRelay"),
       udpStunInfo: 0,
       peerRouteId: randomU64String(),
       groups: [],
     };
 
     if (this.allowVirtualIP) {
-      const ipEnv = process.env.EASYTIER_IPV4_ADDR;
+      const ipEnv = this.getEnv('EASYTIER_IPV4_ADDR');
       if (ipEnv) {
         myInfo.ipv4Addr = { addr: parseIpv4ToU32Be(ipEnv) };
         this.ipAutoAssigned = false;
-      } else if (process.env.EASYTIER_AUTO_IPV4_ADDR === '1') {
+      } else if (this.getEnv('EASYTIER_AUTO_IPV4_ADDR') === '1') {
         const lastOctet = (Number(MY_PEER_ID) % 250) + 2;
         myInfo.ipv4Addr = { addr: parseIpv4ToU32Be(`10.0.0.${lastOctet}`) };
         this.ipAutoAssigned = true;
@@ -187,12 +206,14 @@ export class PeerManager {
     const next = !!enabled;
     if (next === this.pureP2PMode) return;
     this.pureP2PMode = next;
-    const myInfo = this.ensureMyInfo();
-    myInfo.featureFlag = {
-      ...myInfo.featureFlag,
-      avoidRelayData: this.pureP2PMode,
-    };
-    this.bumpMyInfoVersion();
+    const myInfo = this.myInfo;
+    if (myInfo) {
+      myInfo.featureFlag = {
+        ...myInfo.featureFlag,
+        avoidRelayData: this.pureP2PMode,
+      };
+      this.bumpMyInfoVersion();
+    }
   }
 
   isPureP2PMode() {
@@ -332,9 +353,14 @@ export class PeerManager {
 
   updatePeerInfo(groupKey, peerId, info) {
     const infos = this._getPeerInfosMap(groupKey, true);
-    const isNew = !infos.has(peerId);
+    const previous = infos.get(peerId);
+    const previousVersion = previous && previous.version ? Number(previous.version) : 0;
+    const nextVersion = info && info.version ? Number(info.version) : 0;
+    const isNew = !previous;
+    const changed = isNew || nextVersion > previousVersion || JSON.stringify(previous || {}) !== JSON.stringify(info || {});
+
     infos.set(peerId, info);
-    if (isNew) {
+    if (changed) {
       this.bumpAllPeerConnVersions(groupKey);
     }
 
@@ -346,11 +372,11 @@ export class PeerManager {
       if (peerIpv4 !== null && Number.isFinite(netLen) && netLen > 0) {
         const derived = deriveSameNetworkIpv4(peerIpv4, netLen, MY_PEER_ID);
         if (derived !== null) {
-          let changed = false;
+          let myInfoChanged = false;
           if (!this.netConfiguredByEnv) {
             if (myInfo.networkLength !== netLen) {
               myInfo.networkLength = netLen;
-              changed = true;
+              myInfoChanged = true;
             }
           }
           const prevAddr = myInfo.ipv4Addr && typeof myInfo.ipv4Addr.addr === 'number'
@@ -358,16 +384,18 @@ export class PeerManager {
             : null;
           if (prevAddr !== derived) {
             myInfo.ipv4Addr = { addr: derived };
-            changed = true;
+            myInfoChanged = true;
           }
 
-          if (changed) {
+          if (myInfoChanged) {
             this.bumpMyInfoVersion();
             this.ipAutoAssigned = false;
           }
         }
       }
     }
+
+    return changed;
   }
 
   broadcastRouteUpdate(types, groupKey, excludePeerId, opts = {}) {
@@ -479,7 +507,7 @@ export class PeerManager {
     }
 
     const foreignNetworkInfos = (() => {
-      const mode = (process.env.EASYTIER_HANDSHAKE_MODE || 'foreign').toLowerCase();
+      const mode = String(this.getEnv('EASYTIER_HANDSHAKE_MODE', 'foreign')).toLowerCase();
       if (mode === 'same' || mode === 'same_network') return null;
       const version = session.foreignNetVer + 1;
       session.foreignNetVer = version;
@@ -487,7 +515,7 @@ export class PeerManager {
         infos: [{
           key: {
             peerId: MY_PEER_ID,
-            networkName: process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'dev-websocket-relay'
+            networkName: this.getEnv('EASYTIER_PUBLIC_SERVER_NETWORK_NAME', 'dev-websocket-relay')
           },
           value: {
             foreignPeerIds: Array.from(allPeers),
@@ -530,7 +558,7 @@ export class PeerManager {
         domainName: ws.domainName || "public_server",
         protoName: 'OspfRouteRpc',
         serviceName: 'OspfRouteRpc',
-        methodIndex: process.env.EASYTIER_OSPF_ROUTE_METHOD_INDEX ? Number(process.env.EASYTIER_OSPF_ROUTE_METHOD_INDEX) : 1
+        methodIndex: this.getEnv('EASYTIER_OSPF_ROUTE_METHOD_INDEX') ? Number(this.getEnv('EASYTIER_OSPF_ROUTE_METHOD_INDEX')) : 1
       },
       body: rpcRequestBytes,
       isRequest: true,
