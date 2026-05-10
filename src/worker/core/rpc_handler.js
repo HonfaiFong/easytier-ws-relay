@@ -9,17 +9,14 @@ import { loadProtos } from './protos.js';
 function toLongForProto(value) {
   if (value === null || value === undefined) return value;
 
-  // If it's already a Long-like object with low/high
   if (value && typeof value === 'object' && typeof value.low === 'number' && typeof value.high === 'number') {
     return value;
   }
 
-  // If it's a Long instance
   if (value && typeof value === 'object' && value.constructor && value.constructor.name === 'Long') {
     return value;
   }
 
-  // If it's a string, try to parse as BigInt first, then convert
   if (typeof value === 'string') {
     try {
       const big = BigInt(value);
@@ -32,14 +29,12 @@ function toLongForProto(value) {
     }
   }
 
-  // If it's a number, convert to Long
   if (typeof value === 'number') {
     const low = value | 0;
     const high = Math.floor(value / 4294967296);
     return { low, high, unsigned: false };
   }
 
-  // If it's a BigInt
   if (typeof value === 'bigint') {
     const low = Number(value & 0xffffffffn);
     const high = Number((value >> 32n) & 0xffffffffn);
@@ -129,7 +124,7 @@ function buildPeerCenterResponseMap(groupKey, state) {
 }
 
 function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
-  if (!ws || ws.readyState !== 1) { // WS_OPEN
+  if (!ws || ws.readyState !== 1) {
     console.error(`sendRpcResponse aborted: socket not open (readyState=${ws ? ws.readyState : 'nil'}) toPeer=${toPeerId}`);
     return;
   }
@@ -152,11 +147,9 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
   };
   const rpcResponseBytes = types.RpcResponse.encode(rpcResponsePayload).finish();
 
-  // Detailed transactionId logging to debug int64 encoding issues
   const txId = reqRpcPacket.transactionId;
   let txIdValue, txIdType;
   if (txId && typeof txId === 'object' && txId.constructor && txId.constructor.name === 'Long') {
-    // Long object from protobufjs
     txIdValue = txId.toString();
     txIdType = 'Long';
   } else if (typeof txId === 'bigint') {
@@ -169,7 +162,6 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
     txIdValue = String(txId);
     txIdType = 'Number';
   } else if (txId && typeof txId === 'object' && typeof txId.low === 'number' && typeof txId.high === 'number') {
-    // Plain Long-like object
     const combined = (BigInt(txId.high) << 32n) | BigInt(txId.low >>> 0);
     txIdValue = combined.toString();
     txIdType = 'Long-like';
@@ -179,7 +171,6 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
   }
   console.log(`sendRpcResponse: transactionId=${txIdValue} (${txIdType}) raw=${JSON.stringify(txId)}`);
 
-  // Convert transactionId to proper Long format for protobuf encoding
   const txIdForEncoding = toLongForProto(txId);
 
   const rpcRespPacket = {
@@ -201,7 +192,6 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
     console.log(`RpcResp -> to=${toPeerId} txLen=${buf.length} txTransaction=${txIdValue} SUCCESS`);
   } catch (e) {
     console.error(`sendRpcResponse to ${toPeerId} failed: ${e.message}`);
-    // Re-throw to ensure caller knows the send failed
     throw new Error(`Failed to send RPC response to ${toPeerId}: ${e.message}`);
   }
 }
@@ -210,7 +200,6 @@ export function handleRpcReq(ws, header, payload, types) {
   try {
     const rpcPacket = types.RpcPacket.decode(payload);
 
-    // Log transactionId details for debugging int64 issues
     const txId = rpcPacket.transactionId;
     let txIdValue, txIdType, txIdDetails;
     if (txId && typeof txId === 'object' && txId.constructor && txId.constructor.name === 'Long') {
@@ -340,7 +329,6 @@ export function handleRpcResp(ws, header, payload, types) {
     console.log(`RpcResp <- from=${header.fromPeerId} to=${header.toPeerId} len=${payload.length} packetType=${header.packetType} forwardCounter=${header.forwardCounter}`);
     const rpcPacket = types.RpcPacket.decode(payload);
 
-    // Detailed logging for transactionId debugging
     const txId = rpcPacket.transactionId;
     let txIdValue, txIdType, txIdDetails;
     if (txId && typeof txId === 'object' && txId.constructor && txId.constructor.name === 'Long') {
@@ -382,16 +370,14 @@ export function handleRpcResp(ws, header, payload, types) {
 
     const descriptor = rpcPacket.descriptor || {};
     let rpcRespBody = rpcPacket.body;
-    // Generic RpcResponse decode first (outer wrapper)
     let rpcResponseDecoded = null;
     try {
       rpcResponseDecoded = types.RpcResponse.decode(rpcRespBody);
       rpcRespBody = rpcResponseDecoded.response || rpcRespBody;
     } catch (e) {
-      // keep raw body for best-effort handling below
       console.warn(`RpcResp wrapper decode failed from ${header.fromPeerId}: ${e.message}`);
     }
-    // Handle SyncRouteInfoResponse ack (OspfRouteRpc)
+
     if ((descriptor.serviceName === 'peer_rpc.OspfRouteRpc' || descriptor.serviceName === 'OspfRouteRpc')
       && (descriptor.protoName === 'peer_rpc' || descriptor.protoName === 'peer_rpc.OspfRouteRpc' || descriptor.protoName === 'OspfRouteRpc' || !descriptor.protoName)) {
       try {
@@ -407,7 +393,6 @@ export function handleRpcResp(ws, header, payload, types) {
       return;
     }
 
-    // Generic RpcResponse logging
     if (rpcResponseDecoded) {
       if (rpcResponseDecoded.error) {
         console.warn(`RpcResp error from ${header.fromPeerId}:`, rpcResponseDecoded.error);
@@ -432,17 +417,12 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
   }
   pm().onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
 
-  let hasNewPeers = false;
+  let routeChanged = false;
   if (syncReq.peerInfos && syncReq.peerInfos.items) {
     syncReq.peerInfos.items.forEach(info => {
-      if (info.peerId !== MY_PEER_ID) {
-        const infos = pm()._getPeerInfosMap(groupKey, false);
-        const isNew = !infos || !infos.has(info.peerId);
-        pm().updatePeerInfo(groupKey, info.peerId, info);
-        if (isNew) hasNewPeers = true;
-      }
-      if (info.peerId === MY_PEER_ID) {
-        pm().updatePeerInfo(groupKey, info.peerId, info);
+      const changed = pm().updatePeerInfo(groupKey, info.peerId, info);
+      if (info.peerId !== MY_PEER_ID && changed) {
+        routeChanged = true;
       }
     });
   }
@@ -456,17 +436,13 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
     console.warn(`Client sent COMPRESSED RPC body (Algo: ${reqRpcPacket.compressionInfo.algo}). We might have failed to decode it correctly if we didn't decompress.`);
   }
 
-  // Respond with SyncRouteInfoResponse - wrapped in try-catch to ensure response always sends
-  // This fixes the "sync_route_info failed timeout" error that prevents DO hibernation
   try {
     sendRpcResponse(ws, fromPeerId, reqRpcPacket, types, respBytes);
     console.log(`Sent SyncRouteInfoResponse to peer ${fromPeerId}, transactionId=${reqRpcPacket.transactionId}`);
   } catch (e) {
     console.error(`CRITICAL: Failed to send SyncRouteInfoResponse to peer ${fromPeerId}: ${e.message}`);
-    // Don't rethrow - we want the RPC to complete even if pushRouteUpdateTo fails
   }
 
-  // After responding, push our current route info back to the requester (mirrors node behavior).
   try {
     pm().pushRouteUpdateTo(fromPeerId, ws, types, { forceFull: true });
     console.log(`Successfully pushed route update to peer ${fromPeerId}`);
@@ -474,7 +450,7 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
     console.error(`Failed to push route update to peer ${fromPeerId}:`, e);
   }
 
-  if (hasNewPeers) {
+  if (routeChanged) {
     try {
       pm().broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: true });
       console.log(`Successfully broadcast route update for group ${groupKey}`);
