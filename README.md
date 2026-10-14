@@ -212,6 +212,7 @@ RPC 仅协商 `None`，大响应也不会使用 Gzip。发给中继自身的 Zst
 
 ```bash
 npm ci
+npm run check:upstream
 npm test
 npm exec wrangler deploy -- --dry-run
 ```
@@ -227,6 +228,8 @@ npm run test:runtime
 回归测试与验证边界见 [修复说明](./docs/review-fixes.md)。
 
 第三轮出站限流、控制报文重试与 PeerCenter 可选双向确认策略见 [第三轮修复说明](./docs/review-round3-fixes.md)。普通透传超额时丢包；中继控制报文使用保留预算及有界重试队列。标准明文转发 RPC 必须显式包含与外层一致的来源和目标 ID。
+
+第四轮先按官方 `v2.6.4` 同步协议，再修复 RPC 分发、重复路由重试、握手失败清理及资源配额，详见 [第四轮修复说明](./docs/review-round4-fixes.md)。`npm run sync:upstream` 从锁定的官方提交获取三个协议文件、生成 RPC 方法编号并重新生成 Protobuf 代码；`npm run check:upstream` 离线校验来源哈希和方法定义。上游文件来源及原始/空白规范化后的 SHA-256 保存在 `protos/upstream.json`。`PeerCenterRpc.ReportPeers=1`、`GetGlobalPeerMap=2`、`OspfRouteRpc.SyncRouteInfo=1`，不再支持零起始的方法编号或路由方法编号覆盖配置。
 
 ## 贡献
 

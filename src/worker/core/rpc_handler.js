@@ -4,6 +4,7 @@ import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String, sha256 } from './crypto.js';
 import { positiveLimit } from './security.js';
 import { OutboundError } from './errors.js';
+import { RPC_METHODS } from './rpc_methods.js';
 
 // Helper to convert transactionId to proper format for protobuf int64
 function toLongForProto(value) {
@@ -69,6 +70,7 @@ function cleanPeerCenterState(pm, now = Date.now()) {
     for (const [pid, info] of s.globalPeerMap.entries()) {
       if (now - (info.lastSeen || 0) > ttl) {
         s.globalPeerMap.delete(pid);
+        s.responseCache = null;
       }
     }
     if (now - (s.lastTouch || 0) > ttl && s.globalPeerMap.size === 0) {
@@ -128,6 +130,27 @@ function buildPeerCenterResponseMap(pm, groupKey, state) {
   return out;
 }
 
+function getPeerCenterResponse(pm, groupKey, state, types, maxBytes) {
+  const now = Date.now();
+  // Checking membership is cheap; rebuilding the map, hashing and encoding are not.
+  const members = pm.listPeersInGroup(groupKey)
+    .filter(([, ws]) => ws.readyState === 1).map(([id]) => id).sort((a, b) => a - b).join(',');
+  const cached = state.responseCache;
+  if (cached && cached.members === members && now < cached.expiresAt) return cached;
+  const snapshot = buildPeerCenterResponseMap(pm, groupKey, state);
+  state.digest = calcPeerCenterDigestFromMap(snapshot);
+  const ttl = positiveLimit(pm.runtimeEnv, 'EASYTIER_PEER_CENTER_TTL_MS', 180_000, 3600_000);
+  let expiresAt = now + 1000;
+  for (const report of state.globalPeerMap.values()) {
+    const expiry = report.lastSeen + ttl + 1;
+    if (expiry > now) expiresAt = Math.min(expiresAt, expiry);
+  }
+  const bytes = types.GetGlobalPeerMapResponse.encode({ globalPeerMap: snapshot, digest: state.digest }).finish();
+  // Remember an oversize result without retaining its buffer or re-encoding on every query.
+  return state.responseCache = { members, expiresAt, digest: state.digest,
+    bytes: bytes.length <= maxBytes ? bytes : null };
+}
+
 function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes, room) {
   if (!ws || ws.readyState !== 1) {
     console.error(`sendRpcResponse aborted: socket not open (readyState=${ws ? ws.readyState : 'nil'}) toPeer=${toPeerId}`);
@@ -184,10 +207,10 @@ export function handleRpcReq(ws, header, payload, types, room) {
     }
 
     if ((descriptor.serviceName === 'peer_rpc.PeerCenterRpc' || descriptor.serviceName === 'PeerCenterRpc')
-      && (descriptor.protoName === 'peer_rpc' || !descriptor.protoName)) {
+      && (descriptor.protoName === 'PeerCenterRpc' || descriptor.protoName === 'peer_rpc.PeerCenterRpc' || descriptor.protoName === 'peer_rpc' || !descriptor.protoName)) {
       const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
-      const state = getPeerCenterState(pm, groupKey);
-      if (descriptor.methodIndex === 0) {
+      if (descriptor.methodIndex === RPC_METHODS.PeerCenterRpc.ReportPeers) {
+        const state = getPeerCenterState(pm, groupKey);
         const req = types.ReportPeersRequest.decode(innerReqBody);
         const myPeerId = req.myPeerId;
         if (myPeerId !== ws.peerId) throw new Error('PeerCenter identity mismatch');
@@ -203,32 +226,27 @@ export function handleRpcReq(ws, header, payload, types, room) {
           }
         }
         state.globalPeerMap.set(String(myPeerId), { directPeers, lastSeen: Date.now() });
-
-        const snapshot = buildPeerCenterResponseMap(pm, groupKey, state);
-        state.digest = calcPeerCenterDigestFromMap(snapshot);
+        state.responseCache = null;
 
         const respBytes = types.ReportPeersResponse.encode({}).finish();
         sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes, room);
         return;
       }
 
-      if (descriptor.methodIndex === 1) {
+      if (descriptor.methodIndex === RPC_METHODS.PeerCenterRpc.GetGlobalPeerMap) {
         room.checkExpensiveRpc(ws);
+        const state = getPeerCenterState(pm, groupKey);
         const req = types.GetGlobalPeerMapRequest.decode(innerReqBody);
         const reqDigest = req.digest !== undefined && req.digest !== null ? String(req.digest) : '0';
-        const snapshot = buildPeerCenterResponseMap(pm, groupKey, state);
-        state.digest = calcPeerCenterDigestFromMap(snapshot);
-        if (reqDigest === state.digest && reqDigest !== '0') {
+        const response = getPeerCenterResponse(pm, groupKey, state, types, room.maxRpcResponseBytes);
+        if (reqDigest === response.digest && reqDigest !== '0') {
           const respBytes = types.GetGlobalPeerMapResponse.encode({}).finish();
           sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes, room);
           return;
         }
 
-        const respBytes = types.GetGlobalPeerMapResponse.encode({
-          globalPeerMap: snapshot,
-          digest: state.digest,
-        }).finish();
-        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes, room);
+        if (!response.bytes) throw new OutboundError('RPC response too large');
+        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, response.bytes, room);
         return;
       }
 
@@ -239,7 +257,7 @@ export function handleRpcReq(ws, header, payload, types, room) {
       && (descriptor.protoName === 'peer_rpc' || descriptor.protoName === 'peer_rpc.OspfRouteRpc' || descriptor.protoName === 'OspfRouteRpc' || !descriptor.protoName)) {
       const req = types.SyncRouteInfoRequest.decode(innerReqBody);
       const fromPeerId = header.fromPeerId;
-      if (descriptor.methodIndex === 0 || descriptor.methodIndex === 1) {
+      if (descriptor.methodIndex === RPC_METHODS.OspfRouteRpc.SyncRouteInfo) {
         handleSyncRouteInfo(ws, fromPeerId, rpcPacket, req, types, room);
         return;
       }

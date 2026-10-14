@@ -47,7 +47,7 @@ async function rpc(r, ws, service, method, type, value, overrides = {}, response
   const body = response ? types.RpcResponse.encode({ response: request }).finish() : types.RpcRequest.encode({ request }).finish();
   const data = types.RpcPacket.encode({
     fromPeer: ws.peerId, toPeer: MY_PEER_ID, transactionId: Long.fromString('9007199254740993'),
-    descriptor: { domainName: ws.domainName, serviceName: service, protoName: 'peer_rpc', methodIndex: method },
+    descriptor: { domainName: ws.domainName, serviceName: service, protoName: service.split('.').at(-1), methodIndex: method },
     body, isRequest: !response, totalPieces: 1, pieceIdx: 0,
     compressionInfo: { algo: 1, acceptedAlgo: 1 }, ...overrides,
   }).finish();
@@ -64,6 +64,32 @@ function lastRoute(ws) {
   const envelope = types.RpcPacket.decode(data.subarray(HEADER_SIZE));
   return types.SyncRouteInfoRequest.decode(types.RpcRequest.decode(envelope.body).request);
 }
+
+test('official v2.6.4 PeerCenter descriptors dispatch one-based methods and preserve transactions', async t => {
+  const r = room(t), a = await handshake(r, 123), b = await handshake(r, 456);
+  // Literal wire values from the upstream Rust client, independent of local constants.
+  await rpc(r, a, 'PeerCenterRpc', 1, types.ReportPeersRequest,
+    { myPeerId: 123, peerInfos: { directPeers: { 456: { latencyMs: 12 } } } },
+    { transactionId: Long.fromString('9007199254740995'), compressionInfo: { algo: 1, acceptedAlgo: 3 } });
+  const report = lastResponse(a);
+  assert.equal(report.envelope.descriptor.protoName, 'PeerCenterRpc');
+  assert.equal(report.envelope.descriptor.methodIndex, 1);
+  assert.equal(report.envelope.transactionId.toString(), '9007199254740995');
+  assert.equal(report.envelope.isRequest, false);
+  assert.equal(report.body.length, 0, 'ReportPeersResponse is an empty message');
+  assert.equal(r.peerManager.peerCenterStateByGroup.get(a.groupKey).globalPeerMap.get('123').directPeers[456].latencyMs, 12);
+  await rpc(r, b, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {},
+    { transactionId: Long.fromString('9007199254740997'), compressionInfo: { algo: 1, acceptedAlgo: 3 } });
+  const map = lastResponse(b);
+  assert.equal(map.envelope.descriptor.methodIndex, 2);
+  assert.equal(map.envelope.transactionId.toString(), '9007199254740997');
+  assert.equal(map.envelope.isRequest, false);
+  assert.equal(types.GetGlobalPeerMapResponse.decode(map.body).globalPeerMap[123].directPeers[456].latencyMs, 12);
+  const before = a.sent.length;
+  await rpc(r, a, 'PeerCenterRpc', 0, types.ReportPeersRequest, { myPeerId: 123 });
+  assert.equal(a.sent.length, before, 'No ambiguous zero-based PeerCenter dispatch');
+  assert.equal(a.readyState, 1);
+});
 
 test('handshake persists connection identity and uses room env', async t => {
   const r = room(t, { EASYTIER_PUBLIC_SERVER_NETWORK_NAME: 'configured', EASYTIER_NETWORK_LENGTH: '20' });
@@ -179,7 +205,7 @@ test('rooms isolate peers, digests, config and PeerCenter data', async t => {
   assert.notEqual(a.peerManager, b.peerManager);
   assert.equal(a.peerManager.isPureP2PMode(), true);
   assert.equal(b.peerManager.isPureP2PMode(), false);
-  await rpc(a, wa, 'PeerCenterRpc', 0, types.ReportPeersRequest, { myPeerId: 123, peerInfos: { directPeers: { 999: { latencyMs: 12 } } } });
+  await rpc(a, wa, 'PeerCenterRpc', 1, types.ReportPeersRequest, { myPeerId: 123, peerInfos: { directPeers: { 999: { latencyMs: 12 } } } });
   assert.equal(b.peerManager.peerCenterStateByGroup.size, 0);
 });
 
@@ -342,8 +368,8 @@ test('RPC responses above 256 bytes stay uncompressed and retain int64 transacti
   const r = room(t), ws = await handshake(r, 123);
   const directPeers = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [i + 500, { latencyMs: i + 1 }]));
   for (const id of Object.keys(directPeers)) await handshake(r, Number(id));
-  await rpc(r, ws, 'PeerCenterRpc', 0, types.ReportPeersRequest, { myPeerId: 123, peerInfos: { directPeers } });
-  await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  await rpc(r, ws, 'PeerCenterRpc', 1, types.ReportPeersRequest, { myPeerId: 123, peerInfos: { directPeers } });
+  await rpc(r, ws, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
   const { envelope, body } = lastResponse(ws);
   assert.ok(body.length > 256);
   assert.equal(envelope.compressionInfo.algo, 1);
@@ -356,7 +382,7 @@ test('global map requests have an independent rate limit', async t => {
   const r = room(t, { EASYTIER_MAX_GLOBAL_MAP_REQUESTS_PER_SECOND: '2' });
   const ws = await handshake(r, 123);
   for (let i = 0; i < 3; i++) {
-    await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+    await rpc(r, ws, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
   }
   assert.equal(ws.closeCode, 1008);
   assert.equal(ws.expensiveRpcWindowCount, 3);
@@ -367,9 +393,9 @@ test('global map responses are capped before transmission', async t => {
   const ws = await handshake(r, 123);
   const directPeers = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [i + 500, { latencyMs: i + 1 }]));
   for (const id of Object.keys(directPeers)) await handshake(r, Number(id));
-  await rpc(r, ws, 'PeerCenterRpc', 0, types.ReportPeersRequest, { myPeerId: 123, peerInfos: { directPeers } });
+  await rpc(r, ws, 'PeerCenterRpc', 1, types.ReportPeersRequest, { myPeerId: 123, peerInfos: { directPeers } });
   const before = ws.sent.length;
-  await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  await rpc(r, ws, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
   assert.equal(ws.readyState, 1);
   assert.equal(ws.sent.length, before);
 });
@@ -377,7 +403,7 @@ test('global map responses are capped before transmission', async t => {
 for (const response of [false, true]) {
   test(`compressed RPC ${response ? 'response' : 'request'} is explicitly rejected`, async t => {
     const r = room(t), ws = await handshake(r, 123);
-    await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {}, { compressionInfo: { algo: 2, acceptedAlgo: 1 } }, response);
+    await rpc(r, ws, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {}, { compressionInfo: { algo: 2, acceptedAlgo: 1 } }, response);
     assert.equal(ws.closeCode, 1003);
     assert.match(ws.closeReason, /compression unsupported/);
   });
@@ -387,7 +413,7 @@ test('RPC inner source, report identity and route identity cannot be forged', as
   for (const mode of ['envelope', 'report', 'route']) {
     const r = room(t), ws = await handshake(r, 123);
     if (mode === 'route') await rpc(r, ws, 'OspfRouteRpc', 1, types.SyncRouteInfoRequest, { myPeerId: 999 });
-    else await rpc(r, ws, 'PeerCenterRpc', 0, types.ReportPeersRequest, { myPeerId: mode === 'report' ? 999 : 123 }, mode === 'envelope' ? { fromPeer: 999 } : {});
+    else await rpc(r, ws, 'PeerCenterRpc', 1, types.ReportPeersRequest, { myPeerId: mode === 'report' ? 999 : 123 }, mode === 'envelope' ? { fromPeer: 999 } : {});
     assert.equal(ws.closeCode, 1002);
   }
 });
@@ -414,9 +440,9 @@ test('a peer cannot advertise an unconnected route or create a relay link to it'
   const route = lastRoute(live);
   assert.equal(route.peerInfos.items.some(info => info.peerId === 999), false);
   assert.equal(route.connBitmap.peerIds.some(info => info.peerId === 999), false);
-  await rpc(r, live, 'PeerCenterRpc', 0, types.ReportPeersRequest,
+  await rpc(r, live, 'PeerCenterRpc', 1, types.ReportPeersRequest,
     { myPeerId: 456, peerInfos: { directPeers: { 999: { latencyMs: 1 } } } });
-  await rpc(r, live, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  await rpc(r, live, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
   assert.equal(types.GetGlobalPeerMapResponse.decode(lastResponse(live).body).globalPeerMap[999], undefined);
   assert.equal(types.GetGlobalPeerMapResponse.decode(lastResponse(live).body).globalPeerMap[456].directPeers[999], undefined);
 });
@@ -475,10 +501,10 @@ test('coalesced broadcasts include every peer when updates have different origin
 
 test('PeerCenter digest reflects membership changes before returning an unchanged response', async t => {
   const r = room(t), ws = await handshake(r, 123);
-  await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  await rpc(r, ws, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
   const digest = types.GetGlobalPeerMapResponse.decode(lastResponse(ws).body).digest;
   await handshake(r, 456);
-  await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, { digest });
+  await rpc(r, ws, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, { digest });
   const response = types.GetGlobalPeerMapResponse.decode(lastResponse(ws).body);
   assert.ok(response.globalPeerMap[456]);
   assert.notEqual(response.digest.toString(), digest.toString());
@@ -584,7 +610,7 @@ test('legal RPC at the room limit is queued and answered without a protocol clos
   r.peerManager.flushRouteUpdates();
   const before = ws.sent.length;
   r.outboundWindowBytes = r.maxRoomOutboundBytesPerSecond;
-  await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  await rpc(r, ws, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
   assert.equal(ws.readyState, 1);
   assert.equal(ws.sent.length, before);
   assert.equal(r.pendingControls.size, 1);
@@ -611,7 +637,7 @@ test('closed sockets lose queued responses and dirty routes before reconnect', a
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
   const r = room(t), old = await handshake(r, 123);
   r.outboundWindowBytes = r.maxRoomOutboundBytesPerSecond;
-  await rpc(r, old, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  await rpc(r, old, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
   r.peerManager.pushRouteUpdateTo(123, old, types, { forceFull: true });
   const before = old.sent.length;
   old.readyState = 2;
@@ -632,7 +658,7 @@ test('control queues are bounded and saturation does not turn RPC into invalid i
   r.outboundWindowBytes = r.maxRoomOutboundBytesPerSecond;
   for (let i = 0; i < 32; i++) r.sendControlToSocket(ws, Buffer.alloc(16));
   assert.throws(() => r.sendControlToSocket(ws, Buffer.alloc(16)), RateLimitError);
-  await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  await rpc(r, ws, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
   assert.equal(ws.readyState, 1);
   assert.equal(r.pendingControls.get(ws).frames.length, 32);
   assert.equal(r.pendingControlBytes, 512);
@@ -722,11 +748,11 @@ test('mutual PeerCenter policy confirms, withdraws and expires directed link rep
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
   const r = room(t, { EASYTIER_PEER_CENTER_REQUIRE_MUTUAL: '1', EASYTIER_PEER_CENTER_TTL_MS: '2000' });
   const a = await handshake(r, 123), b = await handshake(r, 456);
-  const report = (ws, directPeers) => rpc(r, ws, 'PeerCenterRpc', 0, types.ReportPeersRequest,
+  const report = (ws, directPeers) => rpc(r, ws, 'PeerCenterRpc', 1, types.ReportPeersRequest,
     { myPeerId: ws.peerId, peerInfos: { directPeers } });
   const snapshot = async () => {
     a.expensiveRpcWindowCount = 0;
-    await rpc(r, a, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+    await rpc(r, a, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
     return types.GetGlobalPeerMapResponse.decode(lastResponse(a).body).globalPeerMap;
   };
   await report(a, { 456: { latencyMs: 10 } });
@@ -746,16 +772,158 @@ test('PeerCenter reconnect cannot resurrect a link from the old connection gener
   const r = room(t, { EASYTIER_PEER_CENTER_REQUIRE_MUTUAL: '1' });
   const a = await handshake(r, 123), b = await handshake(r, 456);
   for (const [ws, target] of [[a, 456], [b, 123]]) {
-    await rpc(r, ws, 'PeerCenterRpc', 0, types.ReportPeersRequest,
+    await rpc(r, ws, 'PeerCenterRpc', 1, types.ReportPeersRequest,
       { myPeerId: ws.peerId, peerInfos: { directPeers: { [target]: { latencyMs: 10 } } } });
   }
   b.readyState = 2;
   const replacement = await handshake(r, 456);
   await r.webSocketClose(b);
-  await rpc(r, replacement, 'PeerCenterRpc', 0, types.ReportPeersRequest,
+  await rpc(r, replacement, 'PeerCenterRpc', 1, types.ReportPeersRequest,
     { myPeerId: 456, peerInfos: { directPeers: { 123: { latencyMs: 20 } } } });
-  await rpc(r, a, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  await rpc(r, a, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
   const map = types.GetGlobalPeerMapResponse.decode(lastResponse(a).body).globalPeerMap;
   assert.equal(map[123].directPeers[456], undefined);
   assert.equal(map[456].directPeers[123], undefined);
+});
+
+test('hundreds of inbound data frames do not regenerate an already queued hibernation route', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const original = room(t), ws = await handshake(original, 123);
+  original.peerManager.flushRouteUpdates();
+  const fresh = Object.assign(new Socket(), { attachment: structuredClone(ws.attachment) });
+  const r = room(t, {}, [fresh]);
+  r.outboundWindowBytes = r.maxRoomOutboundBytesPerSecond;
+  const encode = t.mock.method(types.SyncRouteInfoRequest, 'encode');
+  for (let i = 0; i < 500; i++) await r.webSocketMessage(fresh, packet(123, 456, PacketType.Data));
+  assert.equal(encode.mock.callCount(), 1);
+  assert.equal(r.peerManager.pendingRouteUpdates.size, 1);
+  assert.equal(fresh.routeResyncPending, true);
+  t.mock.timers.tick(1001);
+  assert.equal(encode.mock.callCount(), 2);
+  assert.equal(fresh.routeResyncPending, false);
+  assert.equal(lastRoute(fresh).myPeerId, MY_PEER_ID);
+});
+
+for (const name of ['EASYTIER_MAX_OUTBOUND_FRAME_BYTES', 'EASYTIER_MAX_OUTBOUND_BYTES_PER_SECOND',
+  'EASYTIER_MAX_ROOM_OUTBOUND_BYTES_PER_SECOND', 'EASYTIER_MAX_OUTBOUND_BUFFERED_BYTES']) {
+  test(`startup rejects ${name} unable to fit the configured handshake`, () => {
+    assert.throws(() => new RelayRoom({ getWebSockets: () => [] }, { [name]: '1' }),
+      error => error.message.includes(name) && error.message.includes('handshake response'));
+  });
+}
+
+for (const [error, code] of [[new OutboundError('Permanent capacity'), 1011], [new RateLimitError('Queue full', 1000), 1013]]) {
+  test(`undeliverable handshake closes with ${code} and cleans registered identity`, async t => {
+    const r = room(t), existing = await handshake(r, 456);
+    const send = t.mock.method(r, 'sendControlToSocket', () => { throw error; });
+    const failed = await handshake(r, 123);
+    assert.equal(failed.closeCode, code);
+    assert.equal(failed.attachment.handshakeComplete, false);
+    assert.equal(r.peerManager.getPeerWs(123, failed.groupKey), undefined);
+    assert.equal(r.peerManager._getPeerInfosMap(failed.groupKey).has(123), false);
+    assert.equal(r.peerManager.pendingRouteUpdates.has(failed), false);
+    assert.equal(r.pendingControls.has(failed), false);
+    assert.equal(existing.readyState, 1);
+    send.mock.restore();
+    assert.equal((await handshake(r, 123)).readyState, 1);
+  });
+}
+
+test('room global map quota rejects work before building a response across network groups', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const r = room(t, { EASYTIER_MAX_ROOM_GLOBAL_MAP_REQUESTS_PER_SECOND: '1' });
+  const a = await handshake(r, 123), b = await handshake(r, 456, { networkName: 'other' });
+  const encode = t.mock.method(types.GetGlobalPeerMapResponse, 'encode');
+  await rpc(r, a, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
+  const before = b.sent.length;
+  await rpc(r, b, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
+  assert.equal(encode.mock.callCount(), 1);
+  assert.equal(b.sent.length, before);
+  assert.equal(r.peerManager.peerCenterStateByGroup.has(b.groupKey), false);
+  assert.equal(b.readyState, 1);
+  t.mock.timers.tick(1001);
+  await rpc(r, b, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
+  assert.ok(types.GetGlobalPeerMapResponse.decode(lastResponse(b).body).globalPeerMap[456]);
+});
+
+test('same-version global maps share encoded bodies and keep per-request transaction IDs', async t => {
+  const r = room(t), a = await handshake(r, 123), b = await handshake(r, 456);
+  const encode = t.mock.method(types.GetGlobalPeerMapResponse, 'encode');
+  await rpc(r, a, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {}, { transactionId: Long.fromString('9007199254741001') });
+  await rpc(r, b, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {}, { transactionId: Long.fromString('9007199254741003') });
+  assert.equal(encode.mock.callCount(), 1);
+  assert.deepEqual(lastResponse(a).body, lastResponse(b).body);
+  assert.equal(lastResponse(a).envelope.transactionId.toString(), '9007199254741001');
+  assert.equal(lastResponse(b).envelope.transactionId.toString(), '9007199254741003');
+});
+
+test('PeerCenter cache invalidates reports, disconnects and TTL expiry within its cache window', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const r = room(t, { EASYTIER_PEER_CENTER_TTL_MS: '100' });
+  const a = await handshake(r, 123), b = await handshake(r, 456);
+  const query = async () => {
+    await rpc(r, a, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
+    return types.GetGlobalPeerMapResponse.decode(lastResponse(a).body).globalPeerMap;
+  };
+  assert.equal((await query())[123].directPeers[456], undefined);
+  await rpc(r, a, 'PeerCenterRpc', 1, types.ReportPeersRequest,
+    { myPeerId: 123, peerInfos: { directPeers: { 456: { latencyMs: 12 } } } });
+  assert.equal((await query())[123].directPeers[456].latencyMs, 12);
+  t.mock.timers.tick(101);
+  assert.equal((await query())[123].directPeers[456], undefined);
+  b.readyState = 2;
+  await r.webSocketClose(b);
+  assert.equal((await query())[456], undefined);
+});
+
+test('oversized global map caches do not repeatedly encode or retain oversized response buffers', async t => {
+  const r = room(t, { EASYTIER_MAX_RPC_RESPONSE_BYTES: '1' }), a = await handshake(r, 123), b = await handshake(r, 456);
+  const encode = t.mock.method(types.GetGlobalPeerMapResponse, 'encode');
+  await rpc(r, a, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
+  await rpc(r, b, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
+  assert.equal(encode.mock.callCount(), 1);
+  assert.equal(r.peerManager.peerCenterStateByGroup.get(a.groupKey).responseCache.bytes, null);
+  assert.equal(a.readyState, 1);
+  assert.equal(b.readyState, 1);
+});
+
+test('oversized and excessive local Pings cannot fill the control queue or block RPC', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const r = room(t, { EASYTIER_MAX_PONG_PAYLOAD_BYTES: '8', EASYTIER_MAX_PONGS_PER_SECOND: '2' });
+  const ws = await handshake(r, 123);
+  r.peerManager.flushRouteUpdates();
+  r.outboundWindowBytes = r.maxRoomOutboundBytesPerSecond;
+  await r.webSocketMessage(ws, packet(123, MY_PEER_ID, PacketType.Ping, Buffer.alloc(9)));
+  assert.equal(r.pendingControls.size, 0);
+  for (let i = 0; i < 100; i++) await r.webSocketMessage(ws, packet(123, MY_PEER_ID, PacketType.Ping, Buffer.alloc(8)));
+  assert.equal(r.pendingControls.get(ws).frames.length, 2);
+  await rpc(r, ws, 'PeerCenterRpc', 2, types.GetGlobalPeerMapRequest, {});
+  assert.equal(r.pendingControls.get(ws).frames.length, 3);
+  t.mock.timers.tick(1001);
+  assert.ok(types.GetGlobalPeerMapResponse.decode(lastResponse(ws).body).globalPeerMap[123]);
+  await r.webSocketMessage(ws, packet(123, MY_PEER_ID, PacketType.Ping, Buffer.alloc(8)));
+  assert.equal(parseHeader(ws.sent.at(-1)).packetType, PacketType.Pong);
+  assert.equal(ws.readyState, 1);
+});
+
+test('room Pong byte budget limits aggregate clients while preserving ordinary v2.6.4 pings', async t => {
+  const r = room(t, { EASYTIER_MAX_ROOM_PONG_BYTES_PER_SECOND: '40' });
+  const a = await handshake(r, 123), b = await handshake(r, 456);
+  await r.webSocketMessage(a, packet(123, MY_PEER_ID, PacketType.Ping, Buffer.alloc(4)));
+  await r.webSocketMessage(b, packet(456, MY_PEER_ID, PacketType.Ping, Buffer.alloc(4)));
+  const before = b.sent.length;
+  await r.webSocketMessage(b, packet(456, MY_PEER_ID, PacketType.Ping, Buffer.alloc(4)));
+  assert.equal(b.sent.length, before);
+  assert.equal(r.pongWindowBytes, 40);
+  assert.equal(a.readyState, 1);
+  assert.equal(b.readyState, 1);
+});
+
+test('forwarded Ping remains opaque to local Pong payload limits', async t => {
+  const r = room(t, { EASYTIER_MAX_PONG_PAYLOAD_BYTES: '4' });
+  const a = await handshake(r, 123), b = await handshake(r, 456);
+  const ping = packet(123, 456, PacketType.Ping, Buffer.alloc(100));
+  await r.webSocketMessage(a, ping);
+  assert.deepEqual(b.sent.at(-1), ping);
+  assert.equal(r.pongWindowCount, 0);
 });

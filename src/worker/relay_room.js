@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { parseHeader } from './core/packet.js';
-import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
+import { PacketType, HEADER_SIZE, MY_PEER_ID, MAGIC, VERSION } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
 import { handleHandshake, handlePing, handleForwarding } from './core/basic_handlers.js';
 import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
@@ -32,6 +32,21 @@ export class RelayRoom {
     this.maxOutboundBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_OUTBOUND_BYTES_PER_SECOND', 8 * 1024 * 1024);
     this.maxRoomOutboundBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_ROOM_OUTBOUND_BYTES_PER_SECOND', 32 * 1024 * 1024);
     this.maxOutboundBufferedBytes = positiveLimit(env, 'EASYTIER_MAX_OUTBOUND_BUFFERED_BYTES', 4 * 1024 * 1024);
+    this.handshakeResponseBody = this.types.HandshakeRequest.encode({
+      magic: MAGIC, myPeerId: MY_PEER_ID, version: VERSION,
+      features: ['node-server-v1'],
+      networkName: this.peerManager.getEnv('EASYTIER_PUBLIC_SERVER_NETWORK_NAME', 'public_server'),
+      networkSecretDigest: new Uint8Array(32),
+    }).finish();
+    const minimumControlBytes = HEADER_SIZE + this.handshakeResponseBody.length;
+    for (const [name, capacity] of [
+      ['EASYTIER_MAX_OUTBOUND_FRAME_BYTES', this.maxOutboundFrameBytes],
+      ['EASYTIER_MAX_OUTBOUND_BYTES_PER_SECOND', this.maxOutboundBytesPerSecond],
+      ['EASYTIER_MAX_ROOM_OUTBOUND_BYTES_PER_SECOND', this.maxRoomOutboundBytesPerSecond],
+      ['EASYTIER_MAX_OUTBOUND_BUFFERED_BYTES', this.maxOutboundBufferedBytes],
+    ]) {
+      if (capacity < minimumControlBytes) throw new Error(`${name} must allow a ${minimumControlBytes}-byte handshake response`);
+    }
     // Reserved inside the total budget, so data cannot exhaust local control traffic.
     this.controlReserveBytes = Math.min(64 * 1024, Math.floor(this.maxOutboundBytesPerSecond / 8));
     this.roomControlReserveBytes = Math.min(256 * 1024, Math.floor(this.maxRoomOutboundBytesPerSecond / 8));
@@ -40,6 +55,17 @@ export class RelayRoom {
     this.controlRetryTimer = null;
     this.maxRpcResponseBytes = positiveLimit(env, 'EASYTIER_MAX_RPC_RESPONSE_BYTES', 256 * 1024);
     this.maxGlobalMapRequestsPerSecond = positiveLimit(env, 'EASYTIER_MAX_GLOBAL_MAP_REQUESTS_PER_SECOND', 4);
+    this.maxRoomGlobalMapRequestsPerSecond = positiveLimit(env, 'EASYTIER_MAX_ROOM_GLOBAL_MAP_REQUESTS_PER_SECOND', 32);
+    this.globalMapWindowStart = Date.now();
+    this.globalMapWindowCount = 0;
+    this.maxPongPayloadBytes = positiveLimit(env, 'EASYTIER_MAX_PONG_PAYLOAD_BYTES', 4096);
+    this.maxPongsPerSecond = positiveLimit(env, 'EASYTIER_MAX_PONGS_PER_SECOND', 4);
+    this.maxRoomPongsPerSecond = positiveLimit(env, 'EASYTIER_MAX_ROOM_PONGS_PER_SECOND', 256);
+    this.maxPongBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_PONG_BYTES_PER_SECOND', 16 * 1024);
+    this.maxRoomPongBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_ROOM_PONG_BYTES_PER_SECOND', 64 * 1024);
+    this.pongWindowStart = Date.now();
+    this.pongWindowCount = 0;
+    this.pongWindowBytes = 0;
     this.outboundWindowStart = Date.now();
     this.outboundWindowBytes = 0;
     state.getWebSockets().forEach(ws => this._restoreSocket(ws));
@@ -103,7 +129,7 @@ export class RelayRoom {
           this.peerManager.getPeerWs(ws.peerId, ws.groupKey) !== ws) {
         return this.rejectSocket(ws, 1008, 'Unauthorized peer');
       }
-      if (ws.routeResyncPending) {
+      if (ws.routeResyncPending && !this.peerManager.pendingRouteUpdates.has(ws)) {
         this.peerManager.pushRouteUpdateTo(ws.peerId, ws, this.types, { forceFull: true });
       }
       const payload = buffer.subarray(HEADER_SIZE);
@@ -244,6 +270,39 @@ export class RelayRoom {
       this.rejectSocket(ws, 1008, 'Global map request rate exceeded');
       throw new RateLimitError('Global map request rate exceeded', ws.expensiveRpcWindowStart + 1000);
     }
+    if (now - this.globalMapWindowStart >= 1000) {
+      this.globalMapWindowStart = now;
+      this.globalMapWindowCount = 0;
+    }
+    // Shared saturation is not evidence of an abusive individual client.
+    if (this.globalMapWindowCount >= this.maxRoomGlobalMapRequestsPerSecond) {
+      throw new RateLimitError('Room global map request rate exceeded', this.globalMapWindowStart + 1000);
+    }
+    this.globalMapWindowCount++;
+  }
+
+  allowPong(ws, payloadBytes) {
+    if (payloadBytes > this.maxPongPayloadBytes) return false;
+    const now = Date.now();
+    if (now - ws.pongWindowStart >= 1000) {
+      ws.pongWindowStart = now;
+      ws.pongWindowCount = 0;
+      ws.pongWindowBytes = 0;
+    }
+    if (now - this.pongWindowStart >= 1000) {
+      this.pongWindowStart = now;
+      this.pongWindowCount = 0;
+      this.pongWindowBytes = 0;
+    }
+    if (ws.pongWindowCount >= this.maxPongsPerSecond ||
+        this.pongWindowCount >= this.maxRoomPongsPerSecond ||
+        ws.pongWindowBytes + HEADER_SIZE + payloadBytes > this.maxPongBytesPerSecond ||
+        this.pongWindowBytes + HEADER_SIZE + payloadBytes > this.maxRoomPongBytesPerSecond) return false;
+    ws.pongWindowCount++;
+    this.pongWindowCount++;
+    ws.pongWindowBytes += HEADER_SIZE + payloadBytes;
+    this.pongWindowBytes += HEADER_SIZE + payloadBytes;
+    return true;
   }
 
   rejectSocket(ws, code, reason) {
@@ -290,6 +349,9 @@ export class RelayRoom {
     ws.slowConsumerSince = null;
     ws.expensiveRpcWindowStart = ws.lastSeen;
     ws.expensiveRpcWindowCount = 0;
+    ws.pongWindowStart = ws.lastSeen;
+    ws.pongWindowCount = 0;
+    ws.pongWindowBytes = 0;
     ws.serverSessionId = meta.serverSessionId || randomU64String();
     ws.weAreInitiator = meta.weAreInitiator === true;
     ws.crypto = { enabled: false };

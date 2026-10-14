@@ -1,8 +1,8 @@
 import { Buffer } from 'node:buffer';
-import { MAGIC, VERSION, MY_PEER_ID, PacketType, HEADER_SIZE } from './constants.js';
+import { MAGIC, MY_PEER_ID, PacketType, HEADER_SIZE } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket } from './crypto.js';
-import { OutboundError } from './errors.js';
+import { OutboundError, RateLimitError } from './errors.js';
 
 const WS_OPEN = 1;
 const P2P_SIGNAL_TYPES = new Set([PacketType.RpcReq, PacketType.RpcResp, PacketType.Ping, PacketType.Pong]);
@@ -53,13 +53,14 @@ export function handleHandshake(ws, header, payload, types, room) {
     });
     ws.handshakeComplete = true;
     room.saveSocketMeta(ws);
-    const respBuffer = types.HandshakeRequest.encode({
-      magic: MAGIC, myPeerId: MY_PEER_ID, version: VERSION,
-      features: ['node-server-v1'],
-      networkName: pm.getEnv('EASYTIER_PUBLIC_SERVER_NETWORK_NAME', 'public_server'),
-      networkSecretDigest: new Uint8Array(32),
-    }).finish();
-    room.sendControlToSocket(ws, Buffer.concat([createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length), Buffer.from(respBuffer)]));
+    const respBuffer = room.handshakeResponseBody;
+    try {
+      room.sendControlToSocket(ws, Buffer.concat([createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length), Buffer.from(respBuffer)]));
+    } catch (e) {
+      if (!(e instanceof OutboundError)) throw e;
+      if (!ws.rejected) room.rejectSocket(ws, e instanceof RateLimitError ? 1013 : 1011, 'Handshake response unavailable');
+      return;
+    }
     pm.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
     pm.broadcastRouteUpdate(types, groupKey, req.myPeerId);
   } catch (e) {
@@ -70,6 +71,7 @@ export function handleHandshake(ws, header, payload, types, room) {
 }
 
 export function handlePing(ws, header, payload, room) {
+  if (!room.allowPong(ws, payload.length)) return;
   room.sendControlToSocket(ws, wrapPacket(createHeader, MY_PEER_ID, header.fromPeerId, PacketType.Pong, payload, ws));
 }
 

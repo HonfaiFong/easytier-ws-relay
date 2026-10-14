@@ -1,0 +1,26 @@
+{
+  "version": "v2.6.4",
+  "commit": "8428a89d2dabc94c97d370ec607c6ca142473626",
+  "files": {
+    "common.proto": {
+      "path": "easytier/src/proto/common.proto",
+      "sha256": "a54499dc4cfc8fa6f62c53795b7f0ec743e77095fe0a3637f731a1c886b21f44",
+      "normalizedSha256": "2a8dc39bcadcdf01e5facc30cf5bdc2aa25de68a02c9364f1a6b195b7d723838"
+    },
+    "error.proto": {
+      "path": "easytier/src/proto/error.proto",
+      "sha256": "b188bc24d6657cc84d9d1f009300fac6ab08293fb1b2d31674b85dd5adbb53d9",
+      "normalizedSha256": "b188bc24d6657cc84d9d1f009300fac6ab08293fb1b2d31674b85dd5adbb53d9"
+    },
+    "peer_rpc.proto": {
+      "path": "easytier/src/proto/peer_rpc.proto",
+      "sha256": "8c1d6ffbf0061b5a39ba06ddc60d3ced9dd6dcf9b8a741f44fb5a2f35b71b728",
+      "normalizedSha256": "8c1d6ffbf0061b5a39ba06ddc60d3ced9dd6dcf9b8a741f44fb5a2f35b71b728"
+    }
+  },
+  "rpcGenerator": {
+    "path": "easytier-rpc-build/src/lib.rs",
+    "sha256": "ad51895343dfc7abeb43a29813932ed9417038c0d6db7951f98e162b97146eca",
+    "methodIndexBase": 1
+  }
+}

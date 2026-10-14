@@ -4,6 +4,7 @@ import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String, sha256 } from './crypto.js';
 import { positiveLimit } from './security.js';
 import { RateLimitError } from './errors.js';
+import { RPC_METHODS } from './rpc_methods.js';
 
 const WS_OPEN = 1; // WebSocket.OPEN in CF runtime
 
@@ -334,6 +335,8 @@ export class PeerManager {
       }
     }
     peers.set(peerId, ws);
+    const peerCenterState = this.peerCenterStateByGroup.get(groupKey);
+    if (peerCenterState) peerCenterState.responseCache = null;
     if (isNewPeer || (previous && previous !== ws)) {
       this.bumpAllPeerConnVersions(groupKey);
     }
@@ -348,6 +351,8 @@ export class PeerManager {
     const peers = this._getPeersMap(groupKey, false);
     if (peers?.get(peerId) !== ws) return false;
     peers.delete(peerId);
+    const peerCenterState = this.peerCenterStateByGroup.get(groupKey);
+    if (peerCenterState) peerCenterState.responseCache = null;
     this.peerCenterStateByGroup.get(groupKey)?.globalPeerMap.delete(String(peerId));
     for (const report of this.peerCenterStateByGroup.get(groupKey)?.globalPeerMap.values() || []) {
       delete report.directPeers[String(peerId)];
@@ -660,7 +665,7 @@ export class PeerManager {
         domainName: ws.domainName || "public_server",
         protoName: 'OspfRouteRpc',
         serviceName: 'OspfRouteRpc',
-        methodIndex: this.getEnv('EASYTIER_OSPF_ROUTE_METHOD_INDEX') ? Number(this.getEnv('EASYTIER_OSPF_ROUTE_METHOD_INDEX')) : 1
+        methodIndex: RPC_METHODS.OspfRouteRpc.SyncRouteInfo
       },
       body: rpcRequestBytes,
       isRequest: true,

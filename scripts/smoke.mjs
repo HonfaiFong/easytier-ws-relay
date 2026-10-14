@@ -60,7 +60,7 @@ try {
   assert.deepEqual(await b.read(bytes => parseHeader(bytes).packetType === PacketType.Data), data);
   const signaling = frame(123, 456, PacketType.RpcReq, types.RpcPacket.encode({
     fromPeer: 123, toPeer: 456, transactionId: 42, isRequest: true,
-    descriptor: { serviceName: 'UdpHolePunchRpc', protoName: 'peer_rpc', methodIndex: 0 },
+    descriptor: { serviceName: 'UdpHolePunchRpc', protoName: 'UdpHolePunchRpc', methodIndex: 1 },
     body: types.RpcRequest.encode({ request: Buffer.alloc(0) }).finish(),
     totalPieces: 1, compressionInfo: { algo: 1, acceptedAlgo: 1 },
   }).finish());

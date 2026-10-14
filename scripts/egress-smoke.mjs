@@ -62,7 +62,7 @@ try {
   c.ws.send(frame(c.id, MY_PEER_ID, PacketType.Ping, Buffer.alloc(3000, 3)));
   const rpc = types.RpcPacket.encode({
     fromPeer: c.id, toPeer: MY_PEER_ID, transactionId: 77,
-    descriptor: { protoName: 'peer_rpc', serviceName: 'PeerCenterRpc', methodIndex: 1 },
+    descriptor: { protoName: 'PeerCenterRpc', serviceName: 'PeerCenterRpc', methodIndex: 2 },
     body: types.RpcRequest.encode({ request: types.GetGlobalPeerMapRequest.encode({}).finish() }).finish(),
     isRequest: true, totalPieces: 1, pieceIdx: 0, compressionInfo: { algo: 1, acceptedAlgo: 1 },
   }).finish();
