@@ -3,6 +3,7 @@ import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String, sha256 } from './crypto.js';
 import { positiveLimit } from './security.js';
+import { OutboundError } from './errors.js';
 
 // Helper to convert transactionId to proper format for protobuf int64
 function toLongForProto(value) {
@@ -103,12 +104,23 @@ function buildPeerCenterResponseMap(pm, groupKey, state) {
   const set = new Set(pm.listPeersInGroup(groupKey)
     .filter(([, peerWs]) => peerWs.readyState === 1)
     .map(([pid]) => pid));
+  const now = Date.now();
+  const ttl = positiveLimit(pm.runtimeEnv, 'EASYTIER_PEER_CENTER_TTL_MS', 180_000, 3600_000);
   for (const peerId of set) {
     const key = String(peerId);
     const existing = state.globalPeerMap.get(key);
     const directPeers = {};
-    for (const [reportedPeerId, link] of Object.entries(existing?.directPeers || {})) {
-      if (set.has(Number(reportedPeerId))) directPeers[reportedPeerId] = link;
+    const fresh = existing && now - existing.lastSeen <= ttl;
+    for (const [reportedPeerId, link] of Object.entries(fresh ? existing.directPeers : {})) {
+      // v2.6.4 reports directed links. Optional mutual confirmation is a relay
+      // policy, rather than a change to the upstream default wire semantics.
+      const reverseReport = state.globalPeerMap.get(reportedPeerId);
+      const reciprocal = reverseReport && now - reverseReport.lastSeen <= ttl &&
+        reverseReport.directPeers?.[key];
+      if (set.has(Number(reportedPeerId)) &&
+          (pm.getEnv('EASYTIER_PEER_CENTER_REQUIRE_MUTUAL') !== '1' || reciprocal)) {
+        directPeers[reportedPeerId] = link;
+      }
     }
     out[key] = { directPeers };
     out[key].directPeers[String(MY_PEER_ID)] = { latencyMs: 0 };
@@ -123,8 +135,7 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes, r
   }
   const responseBody = responseBodyBytes;
   if (responseBody.length > room.maxRpcResponseBytes) {
-    room.rejectSocket(ws, 1009, 'RPC response too large');
-    throw new Error('RPC response too large');
+    throw new OutboundError('RPC response too large');
   }
   const compressionInfo = { algo: 1, acceptedAlgo: 1 };
 
@@ -151,12 +162,7 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes, r
   };
   const rpcPacketBytes = types.RpcPacket.encode(rpcRespPacket).finish();
   const buf = wrapPacket(createHeader, MY_PEER_ID, toPeerId, PacketType.RpcResp, rpcPacketBytes, ws);
-  try {
-    room.sendToSocket(ws, buf);
-  } catch (e) {
-    console.error(`sendRpcResponse to ${toPeerId} failed: ${e.message}`);
-    throw new Error(`Failed to send RPC response to ${toPeerId}: ${e.message}`);
-  }
+  room.sendControlToSocket(ws, buf);
 }
 
 export function handleRpcReq(ws, header, payload, types, room) {
@@ -191,6 +197,7 @@ export function handleRpcReq(ws, header, payload, types, room) {
         const directPeers = {};
         if (peers.directPeers) {
           for (const [dstPeerId, info] of Object.entries(peers.directPeers)) {
+            if (Number(dstPeerId) === myPeerId) continue;
             if (pm.getPeerWs(Number(dstPeerId), groupKey)?.readyState !== 1) continue;
             directPeers[String(dstPeerId)] = { latencyMs: (info && typeof info.latencyMs === 'number') ? info.latencyMs : 0 };
           }
@@ -240,6 +247,7 @@ export function handleRpcReq(ws, header, payload, types, room) {
     }
 
   } catch (e) {
+    if (e instanceof OutboundError) return;
     console.warn('RPC rejected:', e.message);
     if (!ws.rejected) room.rejectSocket(ws, 1002, 'Invalid RPC request');
   }

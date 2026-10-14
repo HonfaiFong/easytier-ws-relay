@@ -226,6 +226,8 @@ npm run test:runtime
 
 回归测试与验证边界见 [修复说明](./docs/review-fixes.md)。
 
+第三轮出站限流、控制报文重试与 PeerCenter 可选双向确认策略见 [第三轮修复说明](./docs/review-round3-fixes.md)。普通透传超额时丢包；中继控制报文使用保留预算及有界重试队列。标准明文转发 RPC 必须显式包含与外层一致的来源和目标 ID。
+
 ## 贡献
 
 欢迎提交 Issue 和 Pull Request 来改进本项目。

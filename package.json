@@ -9,6 +9,7 @@
     "start": "wrangler dev",
     "test": "node --test",
     "test:runtime": "node scripts/smoke.mjs",
+    "test:egress": "node scripts/egress-smoke.mjs",
     "generate:protos": "pbjs -t static-module -w es6 -p protos -o src/worker/core/protos_generated.js protos/common.proto protos/error.proto protos/peer_rpc.proto"
   },
   "keywords": [],

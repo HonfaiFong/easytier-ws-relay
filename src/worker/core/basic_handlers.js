@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import { MAGIC, VERSION, MY_PEER_ID, PacketType, HEADER_SIZE } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket } from './crypto.js';
+import { OutboundError } from './errors.js';
 
 const WS_OPEN = 1;
 const P2P_SIGNAL_TYPES = new Set([PacketType.RpcReq, PacketType.RpcResp, PacketType.Ping, PacketType.Pong]);
@@ -58,17 +59,18 @@ export function handleHandshake(ws, header, payload, types, room) {
       networkName: pm.getEnv('EASYTIER_PUBLIC_SERVER_NETWORK_NAME', 'public_server'),
       networkSecretDigest: new Uint8Array(32),
     }).finish();
-    room.sendToSocket(ws, Buffer.concat([createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length), Buffer.from(respBuffer)]));
+    room.sendControlToSocket(ws, Buffer.concat([createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length), Buffer.from(respBuffer)]));
     pm.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
     pm.broadcastRouteUpdate(types, groupKey, req.myPeerId);
   } catch (e) {
+    if (e instanceof OutboundError) return;
     console.warn('Handshake rejected:', e.message);
     if (!ws.rejected) room.rejectSocket(ws, 1008, 'Invalid handshake');
   }
 }
 
 export function handlePing(ws, header, payload, room) {
-  room.sendToSocket(ws, wrapPacket(createHeader, MY_PEER_ID, header.fromPeerId, PacketType.Pong, payload, ws));
+  room.sendControlToSocket(ws, wrapPacket(createHeader, MY_PEER_ID, header.fromPeerId, PacketType.Pong, payload, ws));
 }
 
 export function handleForwarding(sourceWs, header, fullMessage, types, room) {
@@ -79,13 +81,14 @@ export function handleForwarding(sourceWs, header, fullMessage, types, room) {
       (header.packetType === PacketType.RpcReq || header.packetType === PacketType.RpcResp)) {
     try {
       const rpc = types.RpcPacket.decode(fullMessage.subarray(HEADER_SIZE));
-      if ((Object.hasOwn(rpc, 'fromPeer') && rpc.fromPeer !== header.fromPeerId) ||
-          (Object.hasOwn(rpc, 'toPeer') && rpc.toPeer !== header.toPeerId)) {
+      if (!Object.hasOwn(rpc, 'fromPeer') || !Object.hasOwn(rpc, 'toPeer') ||
+          rpc.fromPeer !== header.fromPeerId || rpc.toPeer !== header.toPeerId) {
         room.rejectSocket(sourceWs, 1002, 'Forwarded RPC identity mismatch');
         return;
       }
     } catch (_) {
-      // Opaque signaling from older clients remains end-to-end data.
+      room.rejectSocket(sourceWs, 1002, 'Invalid forwarded RPC envelope');
+      return;
     }
   }
   const targetWs = pm.getPeerWs(header.toPeerId, sourceWs.groupKey);
@@ -93,8 +96,9 @@ export function handleForwarding(sourceWs, header, fullMessage, types, room) {
   try {
     room.sendToSocket(targetWs, fullMessage);
   } catch (e) {
+    if (e instanceof OutboundError) return;
     console.warn('Forward failed:', e.message);
-    if (e.message !== 'Room outbound byte rate exceeded' && !targetWs.rejected) {
+    if (!targetWs.rejected) {
       room.rejectSocket(targetWs, 1011, 'Forward failed');
     }
   }

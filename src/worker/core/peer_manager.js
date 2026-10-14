@@ -3,6 +3,7 @@ import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String, sha256 } from './crypto.js';
 import { positiveLimit } from './security.js';
+import { RateLimitError } from './errors.js';
 
 const WS_OPEN = 1; // WebSocket.OPEN in CF runtime
 
@@ -83,6 +84,8 @@ export class PeerManager {
     this.maxPeerInfoBytes = positiveLimit(env, 'EASYTIER_MAX_PEER_INFO_BYTES', 4096, 16384);
     this.pendingRouteBroadcasts = new Map();
     this.routeBroadcastTimer = null;
+    this.pendingRouteUpdates = new Map(); // physical socket -> latest route intent
+    this.routeRetryTimer = null;
     this.routeBroadcastIntervalMs = positiveLimit(env, 'EASYTIER_ROUTE_BROADCAST_INTERVAL_MS', 100, 1000);
 
     this.allowVirtualIP = false;
@@ -317,6 +320,11 @@ export class PeerManager {
     if (previous && previous !== ws && previous.readyState === WS_OPEN) return false;
     const isNewPeer = !peers.has(peerId);
     if (previous && previous !== ws) {
+      this.dropRouteRetry(previous);
+      this.peerCenterStateByGroup.get(groupKey)?.globalPeerMap.delete(String(peerId));
+      for (const report of this.peerCenterStateByGroup.get(groupKey)?.globalPeerMap.values() || []) {
+        delete report.directPeers[String(peerId)];
+      }
       this.routeSessions.get(groupKey)?.delete(peerId);
       // The replacement starts a new route generation, even if it reuses the
       // same peer ID and reports a lower PeerInfo version.
@@ -333,12 +341,17 @@ export class PeerManager {
   }
 
   removePeer(ws) {
+    this.dropRouteRetry(ws);
     const peerId = ws && ws.peerId;
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
     if (!peerId) return false;
     const peers = this._getPeersMap(groupKey, false);
     if (peers?.get(peerId) !== ws) return false;
     peers.delete(peerId);
+    this.peerCenterStateByGroup.get(groupKey)?.globalPeerMap.delete(String(peerId));
+    for (const report of this.peerCenterStateByGroup.get(groupKey)?.globalPeerMap.values() || []) {
+      delete report.directPeers[String(peerId)];
+    }
     const infos = this._getPeerInfosMap(groupKey, false);
     if (infos) infos.delete(peerId);
     const sessions = this.routeSessions.get(groupKey);
@@ -478,9 +491,37 @@ export class PeerManager {
     }
   }
 
+  dropRouteRetry(ws) {
+    this.pendingRouteUpdates.delete(ws);
+    if (!this.pendingRouteUpdates.size && this.routeRetryTimer) {
+      clearTimeout(this.routeRetryTimer);
+      this.routeRetryTimer = null;
+    }
+  }
+
+  scheduleRouteRetry() {
+    if (!this.routeRetryTimer) {
+      this.routeRetryTimer = setTimeout(() => this.retryRouteUpdates(), 1000);
+    }
+  }
+
+  retryRouteUpdates() {
+    if (this.routeRetryTimer) clearTimeout(this.routeRetryTimer);
+    this.routeRetryTimer = null;
+    for (const [ws, update] of Array.from(this.pendingRouteUpdates)) {
+      // Regenerate from current topology instead of retaining an obsolete frame.
+      this.pushRouteUpdateTo(ws.peerId, ws, this.types, update);
+    }
+  }
+
   pushRouteUpdateTo(targetPeerId, ws, types, opts = {}) {
-    const forceFull = !!opts.forceFull;
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
+    if (!ws || ws.readyState !== WS_OPEN || this.getPeerWs(targetPeerId, groupKey) !== ws) {
+      this.dropRouteRetry(ws);
+      return false;
+    }
+    const forceFull = !!opts.forceFull || !!ws.routeResyncPending ||
+      !!this.pendingRouteUpdates.get(ws)?.forceFull;
     const session = this._getSession(groupKey, targetPeerId, true);
     const myInfo = this.ensureMyInfo();
     if (!ws.serverSessionId) {
@@ -517,6 +558,7 @@ export class PeerManager {
 
     let connBitmap = null;
     let nextBitmapSig = session.lastConnBitmapSig;
+    let nextBitmapVersion = null;
     if (relevantPeers.length > 0) {
       const connVersions = this._getPeerConnVersionMap(groupKey, true);
       const peerIdVersions = relevantPeers.map((pid) => {
@@ -553,7 +595,7 @@ export class PeerManager {
       const connVersion = session.connBitmapVerMap.get(targetPeerId) || 0;
       const nextConnVersion = connVersion || Math.max(...peerIdVersions.map(p => p.version));
       if (forceFullLocal || sig !== session.lastConnBitmapSig) {
-        session.connBitmapVerMap.set(targetPeerId, nextConnVersion);
+        nextBitmapVersion = nextConnVersion;
         nextBitmapSig = sig;
         connBitmap = { peerIds: peerIdVersions, bitmap: bitmapBuf, version: nextConnVersion };
       }
@@ -635,13 +677,24 @@ export class PeerManager {
       else ws.send(frame);
       for (const [pid, version] of nextPeerInfoVersions) session.peerInfoVerMap.set(pid, version);
       session.lastConnBitmapSig = nextBitmapSig;
+      if (nextBitmapVersion !== null) session.connBitmapVerMap.set(targetPeerId, nextBitmapVersion);
       if (nextForeignState) {
         session.foreignNetVer = nextForeignState.version;
         session.lastForeignSignature = nextForeignState.signature;
         session.lastForeignUpdateSeconds = nextForeignState.updatedAt;
       }
+      ws.routeResyncPending = false;
+      this.dropRouteRetry(ws);
+      return true;
     } catch (e) {
-      // ignore
+      if (e instanceof RateLimitError) {
+        this.pendingRouteUpdates.set(ws, { forceFull });
+        this.scheduleRouteRetry();
+      } else {
+        this.dropRouteRetry(ws);
+        console.warn(`Route delivery to ${targetPeerId} failed: ${e.message}`);
+      }
+      return false;
     }
   }
 }

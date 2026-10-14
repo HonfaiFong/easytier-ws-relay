@@ -14,6 +14,8 @@ EASYTIER_MAX_FRAME_BYTES = "1048576"
 EASYTIER_MAX_MESSAGES_PER_SECOND = "1000"
 EASYTIER_MAX_BYTES_PER_SECOND = "8388608"
 EASYTIER_ROUTE_BROADCAST_INTERVAL_MS = "100"
+# Set to "1" to require reciprocal PeerCenter reports instead of upstream directed reports.
+EASYTIER_PEER_CENTER_REQUIRE_MUTUAL = "0"
 LOCATION_HINT = "apac"
 
 [durable_objects]

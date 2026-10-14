@@ -7,6 +7,7 @@ import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
 import { PeerManager } from './core/peer_manager.js';
 import { randomU64String } from './core/crypto.js';
 import { authorizeRelay, positiveLimit } from './core/security.js';
+import { OutboundError, RateLimitError, SocketClosedError } from './core/errors.js';
 
 const VALID_PACKET_TYPES = new Set(Object.values(PacketType).filter(t => t !== PacketType.Invalid));
 
@@ -22,7 +23,7 @@ export class RelayRoom {
     this.types = loadProtos();
     this.peerManager = new PeerManager(env);
     this.peerManager.setTypes(this.types);
-    this.peerManager.sendToSocket = (ws, bytes) => this.sendToSocket(ws, bytes);
+    this.peerManager.sendToSocket = (ws, bytes) => this.sendToSocket(ws, bytes, { control: true });
     this.maxConnections = positiveLimit(env, 'EASYTIER_MAX_CONNECTIONS', 128, this.peerManager.maxRoutePeers);
     this.maxFrameBytes = positiveLimit(env, 'EASYTIER_MAX_FRAME_BYTES', 1024 * 1024);
     this.maxMessagesPerSecond = positiveLimit(env, 'EASYTIER_MAX_MESSAGES_PER_SECOND', 1000, 10000);
@@ -31,6 +32,12 @@ export class RelayRoom {
     this.maxOutboundBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_OUTBOUND_BYTES_PER_SECOND', 8 * 1024 * 1024);
     this.maxRoomOutboundBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_ROOM_OUTBOUND_BYTES_PER_SECOND', 32 * 1024 * 1024);
     this.maxOutboundBufferedBytes = positiveLimit(env, 'EASYTIER_MAX_OUTBOUND_BUFFERED_BYTES', 4 * 1024 * 1024);
+    // Reserved inside the total budget, so data cannot exhaust local control traffic.
+    this.controlReserveBytes = Math.min(64 * 1024, Math.floor(this.maxOutboundBytesPerSecond / 8));
+    this.roomControlReserveBytes = Math.min(256 * 1024, Math.floor(this.maxRoomOutboundBytesPerSecond / 8));
+    this.pendingControls = new Map();
+    this.pendingControlBytes = 0;
+    this.controlRetryTimer = null;
     this.maxRpcResponseBytes = positiveLimit(env, 'EASYTIER_MAX_RPC_RESPONSE_BYTES', 256 * 1024);
     this.maxGlobalMapRequestsPerSecond = positiveLimit(env, 'EASYTIER_MAX_GLOBAL_MAP_REQUESTS_PER_SECOND', 4);
     this.outboundWindowStart = Date.now();
@@ -97,7 +104,6 @@ export class RelayRoom {
         return this.rejectSocket(ws, 1008, 'Unauthorized peer');
       }
       if (ws.routeResyncPending) {
-        ws.routeResyncPending = false;
         this.peerManager.pushRouteUpdateTo(ws.peerId, ws, this.types, { forceFull: true });
       }
       const payload = buffer.subarray(HEADER_SIZE);
@@ -106,23 +112,41 @@ export class RelayRoom {
       else if (header.packetType === PacketType.RpcResp && forServer) handleRpcResp(ws, header, payload, this.types, this);
       else handleForwarding(ws, header, buffer, this.types, this);
     } catch (e) {
+      if (e instanceof OutboundError) return;
       console.warn('Packet rejected:', e.message);
       if (!ws.rejected) this.rejectSocket(ws, 1002, 'Invalid packet');
     }
   }
 
-  sendToSocket(ws, bytes) {
-    if (ws.readyState !== 1) throw new Error('Socket closed');
+  sendToSocket(ws, bytes, { control = false, fromQueue = false } = {}) {
+    if (ws.readyState !== 1 || ws.rejected) throw new SocketClosedError('Socket closed');
     if (bytes.length > this.maxOutboundFrameBytes) {
-      this.rejectSocket(ws, 1009, 'Outbound frame too large');
-      throw new Error('Outbound frame too large');
+      throw new OutboundError('Outbound frame too large');
+    }
+    const now = Date.now();
+    const peerLimit = this.maxOutboundBytesPerSecond - (control ? 0 : this.controlReserveBytes);
+    const roomLimit = this.maxRoomOutboundBytesPerSecond - (control ? 0 : this.roomControlReserveBytes);
+    // A frame that can never fit is not a transient failure; never retry it forever.
+    if (bytes.length > Math.min(peerLimit, roomLimit, this.maxOutboundBufferedBytes)) {
+      throw new OutboundError('Outbound frame exceeds delivery capacity');
+    }
+    if (control && !fromQueue && this.pendingControls.has(ws)) {
+      throw new RateLimitError('Control delivery pending', now + 1000);
+    }
+    if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount < this.maxOutboundBufferedBytes) {
+      ws.slowConsumerSince = null;
     }
     if (typeof ws.bufferedAmount === 'number' &&
         ws.bufferedAmount + bytes.length > this.maxOutboundBufferedBytes) {
-      this.rejectSocket(ws, 1008, 'Slow consumer');
-      throw new Error('Slow consumer');
+      if (ws.bufferedAmount >= this.maxOutboundBufferedBytes) {
+        ws.slowConsumerSince ??= now;
+        if (now - ws.slowConsumerSince >= 1000) {
+          this.rejectSocket(ws, 1008, 'Slow consumer');
+          throw new SocketClosedError('Slow consumer');
+        }
+      }
+      throw new RateLimitError('Outbound buffer full', now + 1000);
     }
-    const now = Date.now();
     if (now - this.outboundWindowStart >= 1000) {
       this.outboundWindowStart = now;
       this.outboundWindowBytes = 0;
@@ -131,16 +155,83 @@ export class RelayRoom {
       ws.outboundWindowStart = now;
       ws.outboundWindowBytes = 0;
     }
-    if (ws.outboundWindowBytes + bytes.length > this.maxOutboundBytesPerSecond) {
-      this.rejectSocket(ws, 1008, 'Outbound byte rate exceeded');
-      throw new Error('Outbound byte rate exceeded');
+    if (ws.outboundWindowBytes + bytes.length > peerLimit) {
+      throw new RateLimitError('Outbound byte rate exceeded', ws.outboundWindowStart + 1000);
     }
-    if (this.outboundWindowBytes + bytes.length > this.maxRoomOutboundBytesPerSecond) {
-      throw new Error('Room outbound byte rate exceeded');
+    if (this.outboundWindowBytes + bytes.length > roomLimit) {
+      throw new RateLimitError('Room outbound byte rate exceeded', this.outboundWindowStart + 1000);
     }
-    ws.send(bytes);
+    try { ws.send(bytes); }
+    catch (_) {
+      this.rejectSocket(ws, 1011, 'WebSocket send failed');
+      throw new SocketClosedError('WebSocket send failed');
+    }
     ws.outboundWindowBytes += bytes.length;
     this.outboundWindowBytes += bytes.length;
+  }
+
+  sendControlToSocket(ws, bytes) {
+    try {
+      this.sendToSocket(ws, bytes, { control: true });
+      return;
+    } catch (e) {
+      if (!(e instanceof RateLimitError)) throw e;
+      const queue = this.pendingControls.get(ws) || { frames: [], bytes: 0 };
+      // Bound both retained bytes and tiny-frame amplification. Clients can retry
+      // RPCs when this queue is full; that is still a resource failure, not 1002.
+      if (queue.frames.length >= 32 || queue.bytes + bytes.length > 1024 * 1024 ||
+          this.pendingControlBytes + bytes.length > 4 * 1024 * 1024) throw e;
+      queue.frames.push(Buffer.from(bytes));
+      queue.bytes += bytes.length;
+      this.pendingControlBytes += bytes.length;
+      this.pendingControls.set(ws, queue);
+      this.scheduleControlRetry();
+    }
+  }
+
+  scheduleControlRetry() {
+    if (!this.controlRetryTimer) {
+      this.controlRetryTimer = setTimeout(() => this.flushControlQueue(), 1000);
+    }
+  }
+
+  flushControlQueue() {
+    if (this.controlRetryTimer) clearTimeout(this.controlRetryTimer);
+    this.controlRetryTimer = null;
+    const blocked = new Set();
+    let progressed;
+    do {
+      progressed = false;
+      // One frame per socket per round. Rotate served sockets behind waiters so
+      // a busy RPC client cannot monopolize each recovered room window.
+      for (const [ws, queue] of Array.from(this.pendingControls)) {
+        if (blocked.has(ws)) continue;
+        const frame = queue.frames[0];
+        try { this.sendToSocket(ws, frame, { control: true, fromQueue: true }); }
+        catch (e) {
+          if (e instanceof RateLimitError) blocked.add(ws);
+          else this.dropControlQueue(ws);
+          continue;
+        }
+        queue.frames.shift();
+        queue.bytes -= frame.length;
+        this.pendingControlBytes -= frame.length;
+        progressed = true;
+        this.pendingControls.delete(ws);
+        if (queue.frames.length) this.pendingControls.set(ws, queue);
+      }
+    } while (progressed);
+    if (this.pendingControls.size) this.scheduleControlRetry();
+  }
+
+  dropControlQueue(ws) {
+    const queue = this.pendingControls.get(ws);
+    if (queue) this.pendingControlBytes -= queue.bytes;
+    this.pendingControls.delete(ws);
+    if (!this.pendingControls.size && this.controlRetryTimer) {
+      clearTimeout(this.controlRetryTimer);
+      this.controlRetryTimer = null;
+    }
   }
 
   checkExpensiveRpc(ws) {
@@ -150,7 +241,8 @@ export class RelayRoom {
       ws.expensiveRpcWindowCount = 0;
     }
     if (++ws.expensiveRpcWindowCount > this.maxGlobalMapRequestsPerSecond) {
-      throw new Error('Global map request rate exceeded');
+      this.rejectSocket(ws, 1008, 'Global map request rate exceeded');
+      throw new RateLimitError('Global map request rate exceeded', ws.expensiveRpcWindowStart + 1000);
     }
   }
 
@@ -163,6 +255,8 @@ export class RelayRoom {
   }
 
   async webSocketClose(ws) {
+    this.dropControlQueue(ws);
+    this.peerManager.dropRouteRetry(ws);
     if (this.peerManager.removePeer(ws)) this.peerManager.broadcastRouteUpdate(this.types, ws.groupKey);
   }
 
@@ -193,6 +287,7 @@ export class RelayRoom {
     ws.rateWindowBytes = 0;
     ws.outboundWindowStart = ws.lastSeen;
     ws.outboundWindowBytes = 0;
+    ws.slowConsumerSince = null;
     ws.expensiveRpcWindowStart = ws.lastSeen;
     ws.expensiveRpcWindowCount = 0;
     ws.serverSessionId = meta.serverSessionId || randomU64String();
