@@ -35,7 +35,7 @@ async function connect(id, group = roomName, accept = true) {
   await once(ws, 'open', { signal: AbortSignal.timeout(5000) });
   const closed = accept ? null : once(ws, 'close', { signal: AbortSignal.timeout(5000) });
   ws.send(frame(id, MY_PEER_ID, PacketType.HandShake, types.HandshakeRequest.encode({
-    magic: MAGIC, myPeerId: id, networkName: 'smoke', networkSecretDigrest: Buffer.alloc(32),
+    magic: MAGIC, myPeerId: id, networkName: 'smoke', networkSecretDigest: Buffer.alloc(32),
   }).finish()));
   if (!accept) {
     const [code] = await closed;

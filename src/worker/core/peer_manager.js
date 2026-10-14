@@ -63,7 +63,7 @@ function makeStubPeerInfo(peerId, networkLength) {
     networkLength: Number(networkLength || 24),
     peerRouteId: randomU64String(),
     groups: [],
-    udpStunInfo: 0,
+    udpNatType: 0,
   };
 }
 
@@ -132,7 +132,7 @@ export class PeerManager {
       easytierVersion: this.getEnv('EASYTIER_VERSION', "cf-ws-relay"),
       lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
       hostname: this.getEnv('EASYTIER_HOSTNAME', "PublicServer_WorkerRelay"),
-      udpStunInfo: 0,
+      udpNatType: 0,
       peerRouteId: randomU64String(),
       groups: [],
     };
@@ -269,6 +269,8 @@ export class PeerManager {
         peerInfoVerMap: new Map(),
         connBitmapVerMap: new Map(),
         foreignNetVer: 0,
+        lastForeignSignature: null,
+        lastForeignUpdateSeconds: 0,
         lastTouch: Date.now(),
         lastConnBitmapSig: null,
       };
@@ -298,6 +300,8 @@ export class PeerManager {
       s.peerInfoVerMap.clear();
       s.connBitmapVerMap.clear();
       s.foreignNetVer = 0;
+      s.lastForeignSignature = null;
+      s.lastForeignUpdateSeconds = 0;
       s.lastConnBitmapSig = null;
     }
     s.dstSessionId = theirSessionId;
@@ -314,9 +318,15 @@ export class PeerManager {
     const isNewPeer = !peers.has(peerId);
     if (previous && previous !== ws) {
       this.routeSessions.get(groupKey)?.delete(peerId);
+      // The replacement starts a new route generation, even if it reuses the
+      // same peer ID and reports a lower PeerInfo version.
+      this._getPeerInfosMap(groupKey, false)?.delete(peerId);
+      for (const session of this.routeSessions.get(groupKey)?.values() || []) {
+        session.peerInfoVerMap.delete(peerId);
+      }
     }
     peers.set(peerId, ws);
-    if (isNewPeer) {
+    if (isNewPeer || (previous && previous !== ws)) {
       this.bumpAllPeerConnVersions(groupKey);
     }
     return true;
@@ -480,14 +490,11 @@ export class PeerManager {
     const forceFullLocal = forceFull || !session.dstSessionId;
     const nextPeerInfoVersions = new Map();
 
-    const allPeers = new Set(this.listPeerIdsInGroup(groupKey));
-    const infos = this._getPeerInfosMap(groupKey, false);
-    if (infos) {
-      for (const pid of infos.keys()) {
-        allPeers.add(pid);
-      }
-    }
-    allPeers.add(targetPeerId);
+    // Only a live WebSocket is a route through this relay. Cached PeerInfo is
+    // not evidence that the relay can forward to that peer.
+    const allPeers = new Set(this.listPeersInGroup(groupKey)
+      .filter(([, peerWs]) => peerWs.readyState === WS_OPEN)
+      .map(([pid]) => pid));
     const relevantPeers = [MY_PEER_ID, ...Array.from(allPeers).filter(p => p !== MY_PEER_ID).sort((a, b) => Number(a) - Number(b))];
     const defaultNetLen = myInfo.networkLength || 24;
 
@@ -534,13 +541,9 @@ export class PeerManager {
       if (serverIdx !== undefined) {
         for (let i = 0; i < peerIdVersions.length; i++) {
           if (i === serverIdx) continue;
-          setBit(serverIdx, i);
-          setBit(i, serverIdx);
-        }
-      } else {
-        for (let i = 0; i < peerIdVersions.length; i++) {
-          for (let j = 0; j < peerIdVersions.length; j++) {
-            setBit(i, j);
+          if (allPeers.has(peerIdVersions[i].peerId)) {
+            setBit(serverIdx, i);
+            setBit(i, serverIdx);
           }
         }
       }
@@ -556,20 +559,27 @@ export class PeerManager {
       }
     }
 
+    let nextForeignState = null;
     const foreignNetworkInfos = (() => {
       const mode = String(this.getEnv('EASYTIER_HANDSHAKE_MODE', 'foreign')).toLowerCase();
       if (mode === 'same' || mode === 'same_network') return null;
-      const version = session.foreignNetVer + 1;
-      session.foreignNetVer = version;
+      const networkName = this.getEnv('EASYTIER_PUBLIC_SERVER_NETWORK_NAME', 'dev-websocket-relay');
+      const foreignPeerIds = Array.from(allPeers).sort((a, b) => Number(a) - Number(b));
+      const signature = JSON.stringify([networkName, foreignPeerIds]);
+      const changed = signature !== session.lastForeignSignature;
+      if (!changed && !forceFullLocal) return null;
+      const version = changed ? session.foreignNetVer + 1 : session.foreignNetVer;
+      const updatedAt = changed ? Math.floor(Date.now() / 1000) : session.lastForeignUpdateSeconds;
+      nextForeignState = { signature, version, updatedAt };
       return {
         infos: [{
           key: {
             peerId: MY_PEER_ID,
-            networkName: this.getEnv('EASYTIER_PUBLIC_SERVER_NETWORK_NAME', 'dev-websocket-relay')
+            networkName
           },
           value: {
-            foreignPeerIds: Array.from(allPeers),
-            lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
+            foreignPeerIds,
+            lastUpdate: { seconds: updatedAt, nanos: 0 },
             version,
             networkSecretDigest: Buffer.alloc(32),
             myPeerIdForThisNetwork: MY_PEER_ID
@@ -620,9 +630,16 @@ export class PeerManager {
 
     const rpcPacketBytes = t.RpcPacket.encode(rpcReqPacket).finish();
     try {
-      ws.send(wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws));
+      const frame = wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws);
+      if (this.sendToSocket) this.sendToSocket(ws, frame);
+      else ws.send(frame);
       for (const [pid, version] of nextPeerInfoVersions) session.peerInfoVerMap.set(pid, version);
       session.lastConnBitmapSig = nextBitmapSig;
+      if (nextForeignState) {
+        session.foreignNetVer = nextForeignState.version;
+        session.lastForeignSignature = nextForeignState.signature;
+        session.lastForeignUpdateSeconds = nextForeignState.updatedAt;
+      }
     } catch (e) {
       // ignore
     }

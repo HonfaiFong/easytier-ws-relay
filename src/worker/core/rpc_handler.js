@@ -100,26 +100,32 @@ function calcPeerCenterDigestFromMap(mapObj) {
 
 function buildPeerCenterResponseMap(pm, groupKey, state) {
   const out = {};
-  const set = new Set(pm.listPeerIdsInGroup(groupKey));
-  const infos = pm._getPeerInfosMap(groupKey, false);
-  if (infos) {
-    for (const pid of infos.keys()) set.add(pid);
-  }
+  const set = new Set(pm.listPeersInGroup(groupKey)
+    .filter(([, peerWs]) => peerWs.readyState === 1)
+    .map(([pid]) => pid));
   for (const peerId of set) {
     const key = String(peerId);
     const existing = state.globalPeerMap.get(key);
-    out[key] = { directPeers: { ...existing?.directPeers } };
+    const directPeers = {};
+    for (const [reportedPeerId, link] of Object.entries(existing?.directPeers || {})) {
+      if (set.has(Number(reportedPeerId))) directPeers[reportedPeerId] = link;
+    }
+    out[key] = { directPeers };
     out[key].directPeers[String(MY_PEER_ID)] = { latencyMs: 0 };
   }
   return out;
 }
 
-function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
+function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes, room) {
   if (!ws || ws.readyState !== 1) {
     console.error(`sendRpcResponse aborted: socket not open (readyState=${ws ? ws.readyState : 'nil'}) toPeer=${toPeerId}`);
     return;
   }
   const responseBody = responseBodyBytes;
+  if (responseBody.length > room.maxRpcResponseBytes) {
+    room.rejectSocket(ws, 1009, 'RPC response too large');
+    throw new Error('RPC response too large');
+  }
   const compressionInfo = { algo: 1, acceptedAlgo: 1 };
 
   const rpcResponsePayload = {
@@ -146,7 +152,7 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
   const rpcPacketBytes = types.RpcPacket.encode(rpcRespPacket).finish();
   const buf = wrapPacket(createHeader, MY_PEER_ID, toPeerId, PacketType.RpcResp, rpcPacketBytes, ws);
   try {
-    ws.send(buf);
+    room.sendToSocket(ws, buf);
   } catch (e) {
     console.error(`sendRpcResponse to ${toPeerId} failed: ${e.message}`);
     throw new Error(`Failed to send RPC response to ${toPeerId}: ${e.message}`);
@@ -185,6 +191,7 @@ export function handleRpcReq(ws, header, payload, types, room) {
         const directPeers = {};
         if (peers.directPeers) {
           for (const [dstPeerId, info] of Object.entries(peers.directPeers)) {
+            if (pm.getPeerWs(Number(dstPeerId), groupKey)?.readyState !== 1) continue;
             directPeers[String(dstPeerId)] = { latencyMs: (info && typeof info.latencyMs === 'number') ? info.latencyMs : 0 };
           }
         }
@@ -194,18 +201,19 @@ export function handleRpcReq(ws, header, payload, types, room) {
         state.digest = calcPeerCenterDigestFromMap(snapshot);
 
         const respBytes = types.ReportPeersResponse.encode({}).finish();
-        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
+        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes, room);
         return;
       }
 
       if (descriptor.methodIndex === 1) {
+        room.checkExpensiveRpc(ws);
         const req = types.GetGlobalPeerMapRequest.decode(innerReqBody);
         const reqDigest = req.digest !== undefined && req.digest !== null ? String(req.digest) : '0';
         const snapshot = buildPeerCenterResponseMap(pm, groupKey, state);
         state.digest = calcPeerCenterDigestFromMap(snapshot);
         if (reqDigest === state.digest && reqDigest !== '0') {
           const respBytes = types.GetGlobalPeerMapResponse.encode({}).finish();
-          sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
+          sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes, room);
           return;
         }
 
@@ -213,7 +221,7 @@ export function handleRpcReq(ws, header, payload, types, room) {
           globalPeerMap: snapshot,
           digest: state.digest,
         }).finish();
-        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
+        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes, room);
         return;
       }
 
@@ -233,7 +241,7 @@ export function handleRpcReq(ws, header, payload, types, room) {
 
   } catch (e) {
     console.warn('RPC rejected:', e.message);
-    room.rejectSocket(ws, 1002, 'Invalid RPC request');
+    if (!ws.rejected) room.rejectSocket(ws, 1002, 'Invalid RPC request');
   }
 }
 
@@ -283,16 +291,20 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types, room)
   const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
   if (syncReq.myPeerId !== ws.peerId) throw new Error('Route identity mismatch');
   const items = syncReq.peerInfos?.items || [];
+  const connPeerInfos = syncReq.connPeerList?.peerConnInfos || [];
   const known = pm._getPeerInfosMap(groupKey, false);
   const ids = new Set(known?.keys() || []);
   const existingCount = ids.size;
   for (const info of items) {
     if (!info.peerId) throw new Error('Invalid route peer');
+    if (info.peerId !== ws.peerId) throw new Error('Unauthorized route peer');
     if (types.RoutePeerInfo.encode(info).finish().length > pm.maxPeerInfoBytes) throw new Error('Peer info size limit exceeded');
-    if (info.peerId !== MY_PEER_ID) ids.add(info.peerId);
+    ids.add(info.peerId);
   }
   if (items.length > pm.maxRoutePeers || ids.size > pm.maxRoutePeers ||
       (syncReq.connBitmap?.peerIds.length || 0) > pm.maxRoutePeers + 1 ||
+      connPeerInfos.length > pm.maxRoutePeers + 1 ||
+      connPeerInfos.some(info => info.connectedPeerIds.length > pm.maxRoutePeers) ||
       (syncReq.foreignNetworkInfos?.infos.length || 0) > pm.maxRoutePeers) {
     throw new Error('Route peer limit exceeded');
   }
@@ -312,12 +324,7 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types, room)
   let routeChanged = false;
   if (syncReq.peerInfos && syncReq.peerInfos.items) {
     syncReq.peerInfos.items.forEach(info => {
-      // A peer may advertise indirect routes, but cannot overwrite another live connection.
-      if (info.peerId !== ws.peerId && pm.getPeerWs(info.peerId, groupKey)) return;
-      const changed = pm.updatePeerInfo(groupKey, info.peerId, info);
-      if (info.peerId !== MY_PEER_ID && changed) {
-        routeChanged = true;
-      }
+      if (pm.updatePeerInfo(groupKey, ws.peerId, info)) routeChanged = true;
     });
   }
 
@@ -328,7 +335,7 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types, room)
   const respBytes = types.SyncRouteInfoResponse.encode(respPayload).finish();
 
   try {
-    sendRpcResponse(ws, fromPeerId, reqRpcPacket, types, respBytes);
+    sendRpcResponse(ws, fromPeerId, reqRpcPacket, types, respBytes, room);
   } catch (e) {
     console.error(`CRITICAL: Failed to send SyncRouteInfoResponse to peer ${fromPeerId}: ${e.message}`);
   }

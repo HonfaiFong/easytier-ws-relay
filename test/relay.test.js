@@ -34,7 +34,7 @@ async function handshake(r, id, options = {}) {
   const ws = new Socket();
   await r.handleSession(ws);
   await r.webSocketMessage(ws, packet(id, MY_PEER_ID, PacketType.HandShake,
-    types.HandshakeRequest.encode({ magic: MAGIC, myPeerId: id, networkName: 'test', networkSecretDigrest: Buffer.alloc(32), ...options }).finish()));
+    types.HandshakeRequest.encode({ magic: MAGIC, myPeerId: id, networkName: 'test', networkSecretDigest: Buffer.alloc(32), ...options }).finish()));
   return ws;
 }
 async function rpc(r, ws, service, method, type, value, overrides = {}, response = false) {
@@ -102,7 +102,7 @@ test('hibernation between upgrade and handshake preserves a fresh connection', a
   const fresh = Object.assign(new Socket(), { attachment: structuredClone(ws.attachment) });
   const restored = room(t, {}, [fresh]);
   await restored.webSocketMessage(fresh, packet(123, MY_PEER_ID, PacketType.HandShake,
-    types.HandshakeRequest.encode({ magic: MAGIC, myPeerId: 123, networkName: 'test', networkSecretDigrest: Buffer.alloc(32) }).finish()));
+    types.HandshakeRequest.encode({ magic: MAGIC, myPeerId: 123, networkName: 'test', networkSecretDigest: Buffer.alloc(32) }).finish()));
   assert.equal(fresh.readyState, 1);
   assert.equal(fresh.attachment.handshakeComplete, true);
 });
@@ -149,9 +149,27 @@ test('late close of old socket cannot remove a reconnect or its routes', async t
   assert.ok(r.peerManager._getPeerInfosMap(next.groupKey).has(123));
 });
 
+test('reconnect with a lower PeerInfo version reaches established route sessions', async t => {
+  const r = room(t);
+  const old = await handshake(r, 123), observer = await handshake(r, 456);
+  await rpc(r, observer, 'OspfRouteRpc', 1, types.SyncRouteInfoRequest,
+    { myPeerId: 456, mySessionId: 42, peerInfos: { items: [{ peerId: 456, version: 2 }] } });
+  await rpc(r, old, 'OspfRouteRpc', 1, types.SyncRouteInfoRequest,
+    { myPeerId: 123, peerInfos: { items: [{ peerId: 123, version: 50 }] } });
+  r.peerManager.flushRouteUpdates();
+  assert.equal(r.peerManager._getSession(old.groupKey, 456).peerInfoVerMap.get(123), 50);
+
+  old.readyState = 2;
+  const replacement = await handshake(r, 123);
+  await r.webSocketClose(old);
+  r.peerManager.flushRouteUpdates();
+  assert.equal(replacement.readyState, 1);
+  assert.equal(lastRoute(observer).peerInfos.items.find(info => info.peerId === 123)?.version, 1);
+});
+
 test('rooms isolate peers, digests, config and PeerCenter data', async t => {
   const a = room(t, { EASYTIER_DISABLE_RELAY: '1' }), b = room(t);
-  const wa = await handshake(a, 123), wb = await handshake(b, 123, { networkSecretDigrest: Buffer.alloc(32, 1) });
+  const wa = await handshake(a, 123), wb = await handshake(b, 123, { networkSecretDigest: Buffer.alloc(32, 1) });
   assert.equal(wb.readyState, 1);
   assert.notEqual(a.peerManager, b.peerManager);
   assert.equal(a.peerManager.isPureP2PMode(), true);
@@ -162,7 +180,7 @@ test('rooms isolate peers, digests, config and PeerCenter data', async t => {
 
 test('network digest mismatch is rejected and registry is cleaned after last close', async t => {
   const r = room(t);
-  const first = await handshake(r, 123, { networkSecretDigrest: Buffer.alloc(0) });
+  const first = await handshake(r, 123, { networkSecretDigest: Buffer.alloc(0) });
   const bad = await handshake(r, 456);
   assert.equal(bad.closeCode, 1008);
   await r.webSocketClose(first);
@@ -178,7 +196,7 @@ test('different networks cannot forward to each other', async t => {
   assert.equal(b.sent.length, before);
 });
 
-for (const [label, override] of [['magic', { magic: 0 }], ['identity', { myPeerId: 456 }], ['reserved ID', { myPeerId: MY_PEER_ID }], ['digest length', { networkSecretDigrest: Buffer.alloc(3) }]]) {
+for (const [label, override] of [['magic', { magic: 0 }], ['identity', { myPeerId: 456 }], ['reserved ID', { myPeerId: MY_PEER_ID }], ['digest length', { networkSecretDigest: Buffer.alloc(3) }]]) {
   test(`reject invalid handshake ${label}`, async t => {
     const ws = await handshake(room(t), 123, override);
     assert.equal(ws.closeCode, 1008);
@@ -242,6 +260,40 @@ test('encrypted and compressed peer data is relayed with original lengths', asyn
   }
 });
 
+test('outbound byte budget disconnects an overactive consumer', async t => {
+  const r = room(t, { EASYTIER_MAX_OUTBOUND_BYTES_PER_SECOND: '1024' });
+  const source = await handshake(r, 123), target = await handshake(r, 456);
+  target.outboundWindowBytes = 0;
+  r.outboundWindowBytes = 0;
+  const data = packet(123, 456, PacketType.Data, Buffer.alloc(600));
+  await r.webSocketMessage(source, data);
+  assert.deepEqual(target.sent.at(-1), data);
+  await r.webSocketMessage(source, data);
+  assert.equal(target.closeCode, 1008);
+  assert.equal(target.closeReason, 'Outbound byte rate exceeded');
+});
+
+test('slow consumer buffer prevents further forwarding', async t => {
+  const r = room(t, { EASYTIER_MAX_OUTBOUND_BUFFERED_BYTES: '1024' });
+  const source = await handshake(r, 123), target = await handshake(r, 456);
+  target.bufferedAmount = 1024;
+  const before = target.sent.length;
+  await r.webSocketMessage(source, packet(123, 456, PacketType.Data, Buffer.alloc(10)));
+  assert.equal(target.closeReason, 'Slow consumer');
+  assert.equal(target.sent.length, before);
+});
+
+test('room outbound budget drops excess forwarding without disconnecting peers', async t => {
+  const r = room(t, { EASYTIER_MAX_ROOM_OUTBOUND_BYTES_PER_SECOND: '2048' });
+  const source = await handshake(r, 123), target = await handshake(r, 456);
+  r.outboundWindowBytes = 0;
+  const frame = packet(123, 456, PacketType.Data, Buffer.alloc(700));
+  const before = target.sent.length;
+  for (let i = 0; i < 3; i++) await r.webSocketMessage(source, frame);
+  assert.equal(target.sent.length, before + 2);
+  assert.equal(target.readyState, 1);
+});
+
 test('pure P2P drops data, foreign and KCP traffic but keeps RPC signaling', async t => {
   const r = room(t, { EASYTIER_DISABLE_RELAY: '1' }), a = await handshake(r, 123), b = await handshake(r, 456);
   assert.equal(r.peerManager.ensureMyInfo().featureFlag.noRelayKcp, true);
@@ -257,9 +309,22 @@ test('pure P2P drops data, foreign and KCP traffic but keeps RPC signaling', asy
   }
 });
 
+test('forwarded plaintext RPC must agree with the outer peer identities', async t => {
+  const r = room(t), source = await handshake(r, 123), target = await handshake(r, 456);
+  const before = target.sent.length;
+  const body = types.RpcPacket.encode({
+    fromPeer: 999, toPeer: 456, isRequest: true, totalPieces: 1,
+    descriptor: { serviceName: 'PeerCenterRpc', methodIndex: 0 },
+  }).finish();
+  await r.webSocketMessage(source, packet(123, 456, PacketType.RpcReq, body));
+  assert.equal(source.closeCode, 1002);
+  assert.equal(target.sent.length, before);
+});
+
 test('RPC responses above 256 bytes stay uncompressed and retain int64 transactions', async t => {
   const r = room(t), ws = await handshake(r, 123);
-  const directPeers = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [i + 500, { latencyMs: i + 1 }]));
+  const directPeers = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [i + 500, { latencyMs: i + 1 }]));
+  for (const id of Object.keys(directPeers)) await handshake(r, Number(id));
   await rpc(r, ws, 'PeerCenterRpc', 0, types.ReportPeersRequest, { myPeerId: 123, peerInfos: { directPeers } });
   await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
   const { envelope, body } = lastResponse(ws);
@@ -268,6 +333,27 @@ test('RPC responses above 256 bytes stay uncompressed and retain int64 transacti
   assert.equal(envelope.compressionInfo.acceptedAlgo, 1);
   assert.equal(envelope.transactionId.toString(), '9007199254740993');
   assert.equal(types.GetGlobalPeerMapResponse.decode(body).globalPeerMap[123].directPeers[500].latencyMs, 1);
+});
+
+test('global map requests have an independent rate limit', async t => {
+  const r = room(t, { EASYTIER_MAX_GLOBAL_MAP_REQUESTS_PER_SECOND: '2' });
+  const ws = await handshake(r, 123);
+  for (let i = 0; i < 3; i++) {
+    await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  }
+  assert.equal(ws.closeCode, 1002);
+  assert.equal(ws.expensiveRpcWindowCount, 3);
+});
+
+test('global map responses are capped before transmission', async t => {
+  const r = room(t, { EASYTIER_MAX_RPC_RESPONSE_BYTES: '256' });
+  const ws = await handshake(r, 123);
+  const directPeers = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [i + 500, { latencyMs: i + 1 }]));
+  for (const id of Object.keys(directPeers)) await handshake(r, Number(id));
+  await rpc(r, ws, 'PeerCenterRpc', 0, types.ReportPeersRequest, { myPeerId: 123, peerInfos: { directPeers } });
+  await rpc(r, ws, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  assert.equal(ws.closeCode, 1009);
+  assert.equal(ws.closeReason, 'RPC response too large');
 });
 
 for (const response of [false, true]) {
@@ -297,6 +383,42 @@ test('oversized route lists are rejected before adding any advertised routes', a
   assert.equal(r.peerManager.peerInfosByGroup.size, 0);
 });
 
+test('a peer cannot advertise an unconnected route or create a relay link to it', async t => {
+  const r = room(t), ws = await handshake(r, 123);
+  await rpc(r, ws, 'OspfRouteRpc', 1, types.SyncRouteInfoRequest,
+    { myPeerId: 123, peerInfos: { items: [{ peerId: 999, version: 1 }] } });
+  assert.equal(ws.closeCode, 1002);
+  assert.equal(r.peerManager._getPeerInfosMap(ws.groupKey, false)?.has(999) ?? false, false);
+
+  const live = await handshake(r, 456);
+  r.peerManager.updatePeerInfo(live.groupKey, 999, { peerId: 999, version: 1 });
+  r.peerManager.pushRouteUpdateTo(456, live, types, { forceFull: true });
+  const route = lastRoute(live);
+  assert.equal(route.peerInfos.items.some(info => info.peerId === 999), false);
+  assert.equal(route.connBitmap.peerIds.some(info => info.peerId === 999), false);
+  await rpc(r, live, 'PeerCenterRpc', 0, types.ReportPeersRequest,
+    { myPeerId: 456, peerInfos: { directPeers: { 999: { latencyMs: 1 } } } });
+  await rpc(r, live, 'PeerCenterRpc', 1, types.GetGlobalPeerMapRequest, {});
+  assert.equal(types.GetGlobalPeerMapResponse.decode(lastResponse(live).body).globalPeerMap[999], undefined);
+  assert.equal(types.GetGlobalPeerMapResponse.decode(lastResponse(live).body).globalPeerMap[456].directPeers[999], undefined);
+});
+
+test('v2.6.4 route identity fields survive decoding and rebroadcast', async t => {
+  const r = room(t), source = await handshake(r, 123), target = await handshake(r, 456);
+  const identity = Buffer.alloc(32, 7);
+  await rpc(r, source, 'OspfRouteRpc', 1, types.SyncRouteInfoRequest, {
+    myPeerId: 123,
+    peerInfos: { items: [{ peerId: 123, version: 2, noiseStaticPubkey: identity,
+      trustedCredentialPubkeys: [{ credential: { pubkey: identity, groups: ['team'] }, credentialHmac: Buffer.alloc(32, 8) }] }] },
+    connPeerList: { peerConnInfos: [{ peerId: { peerId: 123, version: 2 }, connectedPeerIds: [456] }] },
+  });
+  r.peerManager.flushRouteUpdates();
+  const info = lastRoute(target).peerInfos.items.find(item => item.peerId === 123);
+  assert.deepEqual(Buffer.from(info.noiseStaticPubkey), identity);
+  assert.deepEqual(Buffer.from(info.trustedCredentialPubkeys[0].credential.pubkey), identity);
+  assert.equal(source.readyState, 1);
+});
+
 test('route session acknowledgements enable deltas and persist initiator metadata', async t => {
   const r = room(t), ws = await handshake(r, 123);
   const req = { myPeerId: 123, mySessionId: Long.fromString('42', true), isInitiator: true, peerInfos: { items: [{ peerId: 123, version: 2 }] } };
@@ -306,6 +428,20 @@ test('route session acknowledgements enable deltas and persist initiator metadat
   assert.equal(ws.attachment.weAreInitiator, false);
   assert.equal(lastRoute(ws).peerInfos, null);
   assert.equal(lastRoute(ws).connBitmap, null);
+});
+
+test('unchanged foreign network routes retain their version', async t => {
+  const r = room(t), ws = await handshake(r, 123);
+  const initial = lastRoute(ws).foreignNetworkInfos.infos[0].value;
+  r.peerManager.pushRouteUpdateTo(123, ws, types, { forceFull: true });
+  const same = lastRoute(ws).foreignNetworkInfos.infos[0].value;
+  assert.equal(same.version, initial.version);
+  assert.equal(same.lastUpdate.seconds.toString(), initial.lastUpdate.seconds.toString());
+
+  await handshake(r, 456);
+  r.peerManager.flushRouteUpdates();
+  const changed = lastRoute(ws).foreignNetworkInfos.infos[0].value;
+  assert.equal(changed.version, initial.version + 1);
 });
 
 test('coalesced broadcasts include every peer when updates have different origins', async t => {

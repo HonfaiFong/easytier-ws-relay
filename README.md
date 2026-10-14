@@ -21,7 +21,7 @@
 ### 前置要求
 
 - Node.js (>= 22.0.0)
-- pnpm (推荐) 或 npm
+- npm（仓库提交了 `package-lock.json`）
 - Wrangler CLI (Cloudflare Workers 工具链)
 
 ### 安装步骤
@@ -34,9 +34,7 @@ cd easytier-ws-relay
 
 2. 安装依赖：
 ```bash
-pnpm install
-# 或者使用 npm
-npm install
+npm ci
 ```
 
 3. 安装 Wrangler CLI：
@@ -55,7 +53,7 @@ wrangler login
 
 ```bash
 # 启动本地开发服务器
-pnpm run dev
+npm run dev
 # 或者
 wrangler dev --ip 0.0.0.0
 ```
@@ -63,7 +61,7 @@ wrangler dev --ip 0.0.0.0
 ### 直接启动（不监听文件变化）
 
 ```bash
-pnpm run start
+npm run start
 # 或者
 wrangler dev
 ```
@@ -180,7 +178,7 @@ wss://your-deployment.workers.dev:0/ws
 需要限制接入时，将 `EASYTIER_RELAY_TOKEN` 保存为 Cloudflare Secret：
 
 ```bash
-pnpm exec wrangler secret put EASYTIER_RELAY_TOKEN
+npm exec wrangler secret put EASYTIER_RELAY_TOKEN
 ```
 
 客户端可通过 `Authorization: Bearer <token>` 或 URL 参数 `token` 提交令牌，例如 `wss://your-deployment.workers.dev:0/ws?room=my-network&token=<URL编码后的令牌>`。请使用 WSS，并避免在日志中记录完整连接 URL。未配置 Secret 时为公共接入模式。这个共享令牌用于中继接入，不验证单个节点身份或 EasyTier 网络密钥所有权；网络摘要只用于分组和检查同名网络的一致性。
@@ -202,6 +200,12 @@ RPC 仅协商 `None`，大响应也不会使用 Gzip。发给中继自身的 Zst
 | `EASYTIER_MAX_FRAME_BYTES` | 1048576 字节 / 入站帧 | 1048576 |
 | `EASYTIER_MAX_MESSAGES_PER_SECOND` | 1000 帧 / 连接 / 秒 | 10000 |
 | `EASYTIER_MAX_BYTES_PER_SECOND` | 8388608 字节 / 连接 / 秒 | 33554432 |
+| `EASYTIER_MAX_OUTBOUND_FRAME_BYTES` | 1048576 字节 / 出站帧 | 1048576 |
+| `EASYTIER_MAX_OUTBOUND_BYTES_PER_SECOND` | 8388608 字节 / 连接 / 秒 | 8388608 |
+| `EASYTIER_MAX_ROOM_OUTBOUND_BYTES_PER_SECOND` | 33554432 字节 / 房间 / 秒 | 33554432 |
+| `EASYTIER_MAX_OUTBOUND_BUFFERED_BYTES` | 4194304 字节 / 连接 | 4194304 |
+| `EASYTIER_MAX_RPC_RESPONSE_BYTES` | 262144 字节 / 响应体 | 262144 |
+| `EASYTIER_MAX_GLOBAL_MAP_REQUESTS_PER_SECOND` | 4 次 / 连接 / 秒 | 4 |
 | `EASYTIER_ROUTE_BROADCAST_INTERVAL_MS` | 100 毫秒 | 1–1000 |
 
 节点变更会合并广播，已确认会话使用增量 PeerInfo；连接矩阵变化时仍发送完整矩阵。连接元数据在握手和会话变更后保存到 WebSocket Attachment，休眠恢复会重建节点映射并使用新会话 ID 请求完整路由。旧版本缺失身份的 Attachment 会要求重连。
@@ -211,6 +215,8 @@ npm ci
 npm test
 npm exec wrangler deploy -- --dry-run
 ```
+
+协议文件以 EasyTier `v2.6.4`（提交 `8428a89d2dabc94c97d370ec607c6ca142473626`）为基线，来自上游 `easytier/src/proto/`。修改 `.proto` 后运行 `npm run generate:protos`，并验证生成代码与客户端互通。当前中继只接收直接连接节点自身的路由信息；收到的 `conn_peer_list` 不会被采纳为中继可达性证明。尚需使用该版本真实客户端完成端到端互联与休眠唤醒验证。
 
 本地 workerd 冒烟验证（另开终端运行 `wrangler dev --ip 127.0.0.1 --port 18783`）：
 

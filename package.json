@@ -8,11 +8,12 @@
     "dev": "wrangler dev --ip 0.0.0.0",
     "start": "wrangler dev",
     "test": "node --test",
-    "test:runtime": "node scripts/smoke.mjs"
+    "test:runtime": "node scripts/smoke.mjs",
+    "generate:protos": "pbjs -t static-module -w es6 -p protos -o src/worker/core/protos_generated.js protos/common.proto protos/error.proto protos/peer_rpc.proto"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "dotenv": "^16.4.5",
     "long": "^5.3.2",

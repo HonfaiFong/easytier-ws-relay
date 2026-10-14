@@ -22,10 +22,19 @@ export class RelayRoom {
     this.types = loadProtos();
     this.peerManager = new PeerManager(env);
     this.peerManager.setTypes(this.types);
+    this.peerManager.sendToSocket = (ws, bytes) => this.sendToSocket(ws, bytes);
     this.maxConnections = positiveLimit(env, 'EASYTIER_MAX_CONNECTIONS', 128, this.peerManager.maxRoutePeers);
     this.maxFrameBytes = positiveLimit(env, 'EASYTIER_MAX_FRAME_BYTES', 1024 * 1024);
     this.maxMessagesPerSecond = positiveLimit(env, 'EASYTIER_MAX_MESSAGES_PER_SECOND', 1000, 10000);
     this.maxBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_BYTES_PER_SECOND', 8 * 1024 * 1024, 32 * 1024 * 1024);
+    this.maxOutboundFrameBytes = positiveLimit(env, 'EASYTIER_MAX_OUTBOUND_FRAME_BYTES', 1024 * 1024);
+    this.maxOutboundBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_OUTBOUND_BYTES_PER_SECOND', 8 * 1024 * 1024);
+    this.maxRoomOutboundBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_ROOM_OUTBOUND_BYTES_PER_SECOND', 32 * 1024 * 1024);
+    this.maxOutboundBufferedBytes = positiveLimit(env, 'EASYTIER_MAX_OUTBOUND_BUFFERED_BYTES', 4 * 1024 * 1024);
+    this.maxRpcResponseBytes = positiveLimit(env, 'EASYTIER_MAX_RPC_RESPONSE_BYTES', 256 * 1024);
+    this.maxGlobalMapRequestsPerSecond = positiveLimit(env, 'EASYTIER_MAX_GLOBAL_MAP_REQUESTS_PER_SECOND', 4);
+    this.outboundWindowStart = Date.now();
+    this.outboundWindowBytes = 0;
     state.getWebSockets().forEach(ws => this._restoreSocket(ws));
   }
 
@@ -92,13 +101,56 @@ export class RelayRoom {
         this.peerManager.pushRouteUpdateTo(ws.peerId, ws, this.types, { forceFull: true });
       }
       const payload = buffer.subarray(HEADER_SIZE);
-      if (header.packetType === PacketType.Ping && forServer) handlePing(ws, header, payload);
+      if (header.packetType === PacketType.Ping && forServer) handlePing(ws, header, payload, this);
       else if (header.packetType === PacketType.RpcReq && forServer) handleRpcReq(ws, header, payload, this.types, this);
       else if (header.packetType === PacketType.RpcResp && forServer) handleRpcResp(ws, header, payload, this.types, this);
       else handleForwarding(ws, header, buffer, this.types, this);
     } catch (e) {
       console.warn('Packet rejected:', e.message);
-      this.rejectSocket(ws, 1002, 'Invalid packet');
+      if (!ws.rejected) this.rejectSocket(ws, 1002, 'Invalid packet');
+    }
+  }
+
+  sendToSocket(ws, bytes) {
+    if (ws.readyState !== 1) throw new Error('Socket closed');
+    if (bytes.length > this.maxOutboundFrameBytes) {
+      this.rejectSocket(ws, 1009, 'Outbound frame too large');
+      throw new Error('Outbound frame too large');
+    }
+    if (typeof ws.bufferedAmount === 'number' &&
+        ws.bufferedAmount + bytes.length > this.maxOutboundBufferedBytes) {
+      this.rejectSocket(ws, 1008, 'Slow consumer');
+      throw new Error('Slow consumer');
+    }
+    const now = Date.now();
+    if (now - this.outboundWindowStart >= 1000) {
+      this.outboundWindowStart = now;
+      this.outboundWindowBytes = 0;
+    }
+    if (now - ws.outboundWindowStart >= 1000) {
+      ws.outboundWindowStart = now;
+      ws.outboundWindowBytes = 0;
+    }
+    if (ws.outboundWindowBytes + bytes.length > this.maxOutboundBytesPerSecond) {
+      this.rejectSocket(ws, 1008, 'Outbound byte rate exceeded');
+      throw new Error('Outbound byte rate exceeded');
+    }
+    if (this.outboundWindowBytes + bytes.length > this.maxRoomOutboundBytesPerSecond) {
+      throw new Error('Room outbound byte rate exceeded');
+    }
+    ws.send(bytes);
+    ws.outboundWindowBytes += bytes.length;
+    this.outboundWindowBytes += bytes.length;
+  }
+
+  checkExpensiveRpc(ws) {
+    const now = Date.now();
+    if (now - ws.expensiveRpcWindowStart >= 1000) {
+      ws.expensiveRpcWindowStart = now;
+      ws.expensiveRpcWindowCount = 0;
+    }
+    if (++ws.expensiveRpcWindowCount > this.maxGlobalMapRequestsPerSecond) {
+      throw new Error('Global map request rate exceeded');
     }
   }
 
@@ -139,6 +191,10 @@ export class RelayRoom {
     ws.rateWindowStart = ws.lastSeen;
     ws.rateWindowCount = 0;
     ws.rateWindowBytes = 0;
+    ws.outboundWindowStart = ws.lastSeen;
+    ws.outboundWindowBytes = 0;
+    ws.expensiveRpcWindowStart = ws.lastSeen;
+    ws.expensiveRpcWindowCount = 0;
     ws.serverSessionId = meta.serverSessionId || randomU64String();
     ws.weAreInitiator = meta.weAreInitiator === true;
     ws.crypto = { enabled: false };
