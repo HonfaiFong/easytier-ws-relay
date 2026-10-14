@@ -1,7 +1,8 @@
 import { Buffer } from 'buffer';
 import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
-import { wrapPacket, randomU64String } from './crypto.js';
+import { wrapPacket, randomU64String, sha256 } from './crypto.js';
+import { positiveLimit } from './security.js';
 
 const WS_OPEN = 1; // WebSocket.OPEN in CF runtime
 
@@ -67,20 +68,29 @@ function makeStubPeerInfo(peerId, networkLength) {
 }
 
 export class PeerManager {
-  constructor() {
+  constructor(env = {}) {
     this.peersByGroup = new Map(); // groupKey -> Map(peerId -> ws)
     this.peerInfosByGroup = new Map(); // groupKey -> Map(peerId -> peerInfo)
     this.routeSessions = new Map(); // groupKey -> peerId -> session state
     this.peerConnVersions = new Map(); // groupKey -> peerId -> version
     this.types = null;
-    this.runtimeEnv = {};
+    this.runtimeEnv = env;
+    this.networkDigestRegistry = new Map();
+    this.peerCenterStateByGroup = new Map();
+    this.lastPeerCenterClean = 0;
+    this.maxRoutePeers = positiveLimit(env, 'EASYTIER_MAX_ROUTE_PEERS', 256, 1024);
+    this.maxTotalRoutePeers = positiveLimit(env, 'EASYTIER_MAX_TOTAL_ROUTE_PEERS', 1024, 4096);
+    this.maxPeerInfoBytes = positiveLimit(env, 'EASYTIER_MAX_PEER_INFO_BYTES', 4096, 16384);
+    this.pendingRouteBroadcasts = new Map();
+    this.routeBroadcastTimer = null;
+    this.routeBroadcastIntervalMs = positiveLimit(env, 'EASYTIER_ROUTE_BROADCAST_INTERVAL_MS', 100, 1000);
 
     this.allowVirtualIP = false;
     this.ipConfiguredByEnv = !!this.getEnv('EASYTIER_IPV4_ADDR');
     this.netConfiguredByEnv = this.getEnv('EASYTIER_NETWORK_LENGTH') !== undefined;
     this.ipAutoAssigned = false;
     this.myInfo = null; // lazily initialized to avoid random in global scope
-    this.sessionTtlMs = Number(this.getEnv('EASYTIER_SESSION_TTL_MS', 3 * 60 * 1000));
+    this.sessionTtlMs = positiveLimit(env, 'EASYTIER_SESSION_TTL_MS', 180_000, 3600_000);
     this.lastSessionCleanup = 0;
 
     this.pureP2PMode = (this.getEnv('EASYTIER_DISABLE_RELAY') === '1');
@@ -90,9 +100,6 @@ export class PeerManager {
     if (this.runtimeEnv && this.runtimeEnv[name] !== undefined && this.runtimeEnv[name] !== null) {
       return this.runtimeEnv[name];
     }
-    if (typeof process !== 'undefined' && process.env && process.env[name] !== undefined) {
-      return process.env[name];
-    }
     return fallback;
   }
 
@@ -100,7 +107,7 @@ export class PeerManager {
     this.runtimeEnv = env || {};
     this.ipConfiguredByEnv = !!this.getEnv('EASYTIER_IPV4_ADDR');
     this.netConfiguredByEnv = this.getEnv('EASYTIER_NETWORK_LENGTH') !== undefined;
-    this.sessionTtlMs = Number(this.getEnv('EASYTIER_SESSION_TTL_MS', 3 * 60 * 1000));
+    this.sessionTtlMs = positiveLimit(env, 'EASYTIER_SESSION_TTL_MS', 180_000, 3600_000);
     this.setPureP2PMode(this.getEnv('EASYTIER_DISABLE_RELAY') === '1');
   }
 
@@ -119,7 +126,7 @@ export class PeerManager {
         isPublicServer: true,
         avoidRelayData: this.pureP2PMode,
         kcpInput: false,
-        noRelayKcp: false
+        noRelayKcp: this.pureP2PMode
       },
       networkLength: Number(this.getEnv('EASYTIER_NETWORK_LENGTH', 24)),
       easytierVersion: this.getEnv('EASYTIER_VERSION', "cf-ws-relay"),
@@ -211,6 +218,7 @@ export class PeerManager {
       myInfo.featureFlag = {
         ...myInfo.featureFlag,
         avoidRelayData: this.pureP2PMode,
+        noRelayKcp: this.pureP2PMode,
       };
       this.bumpMyInfoVersion();
     }
@@ -284,6 +292,7 @@ export class PeerManager {
   }
 
   onRouteSessionAck(groupKey, peerId, theirSessionId, weAreInitiator) {
+    theirSessionId = String(theirSessionId);
     const s = this._getSession(groupKey, peerId, true);
     if (s.dstSessionId !== theirSessionId) {
       s.peerInfoVerMap.clear();
@@ -300,11 +309,17 @@ export class PeerManager {
   addPeer(peerId, ws) {
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
     const peers = this._getPeersMap(groupKey, true);
+    const previous = peers.get(peerId);
+    if (previous && previous !== ws && previous.readyState === WS_OPEN) return false;
     const isNewPeer = !peers.has(peerId);
+    if (previous && previous !== ws) {
+      this.routeSessions.get(groupKey)?.delete(peerId);
+    }
     peers.set(peerId, ws);
     if (isNewPeer) {
       this.bumpAllPeerConnVersions(groupKey);
     }
+    return true;
   }
 
   removePeer(ws) {
@@ -312,8 +327,8 @@ export class PeerManager {
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
     if (!peerId) return false;
     const peers = this._getPeersMap(groupKey, false);
-    const wasPresent = peers && peers.has(peerId);
-    if (peers) peers.delete(peerId);
+    if (peers?.get(peerId) !== ws) return false;
+    peers.delete(peerId);
     const infos = this._getPeerInfosMap(groupKey, false);
     if (infos) infos.delete(peerId);
     const sessions = this.routeSessions.get(groupKey);
@@ -324,7 +339,7 @@ export class PeerManager {
     const connVers = this._getPeerConnVersionMap(groupKey, false);
     if (connVers) connVers.delete(peerId);
 
-    if (wasPresent && peers && peers.size > 0) {
+    if (peers.size > 0) {
       this.bumpAllPeerConnVersions(groupKey);
     }
 
@@ -332,6 +347,8 @@ export class PeerManager {
       this.peersByGroup.delete(groupKey);
       this.peerInfosByGroup.delete(groupKey);
       this.peerConnVersions.delete(groupKey);
+      this.peerCenterStateByGroup.delete(groupKey);
+      this.networkDigestRegistry.delete(ws.domainName);
     }
     return true;
   }
@@ -352,7 +369,15 @@ export class PeerManager {
   }
 
   updatePeerInfo(groupKey, peerId, info) {
+    if (peerId === MY_PEER_ID) return false;
     const infos = this._getPeerInfosMap(groupKey, true);
+    const total = Array.from(this.peerInfosByGroup.values()).reduce((sum, m) => sum + m.size, 0);
+    if (!infos.has(peerId) && (infos.size >= this.maxRoutePeers || total >= this.maxTotalRoutePeers)) {
+      throw new Error('Route peer limit exceeded');
+    }
+    if (this.types && this.types.RoutePeerInfo.encode(info).finish().length > this.maxPeerInfoBytes) {
+      throw new Error('Peer info size limit exceeded');
+    }
     const previous = infos.get(peerId);
     const previousVersion = previous && previous.version ? Number(previous.version) : 0;
     const nextVersion = info && info.version ? Number(info.version) : 0;
@@ -399,7 +424,29 @@ export class PeerManager {
   }
 
   broadcastRouteUpdate(types, groupKey, excludePeerId, opts = {}) {
-    const forceFull = opts.forceFull !== undefined ? !!opts.forceFull : true;
+    const pending = this.pendingRouteBroadcasts.get(groupKey);
+    this.pendingRouteBroadcasts.set(groupKey, {
+      types,
+      excludePeerId: pending && pending.excludePeerId !== excludePeerId ? undefined : excludePeerId,
+      forceFull: !!opts.forceFull || !!pending?.forceFull,
+    });
+    if (!this.routeBroadcastTimer) {
+      this.routeBroadcastTimer = setTimeout(() => this.flushRouteUpdates(), this.routeBroadcastIntervalMs);
+    }
+  }
+
+  flushRouteUpdates() {
+    if (this.routeBroadcastTimer) clearTimeout(this.routeBroadcastTimer);
+    this.routeBroadcastTimer = null;
+    const pending = this.pendingRouteBroadcasts;
+    this.pendingRouteBroadcasts = new Map();
+    for (const [groupKey, update] of pending) {
+      this._broadcastRouteUpdateNow(update.types, groupKey, update.excludePeerId, update);
+    }
+  }
+
+  _broadcastRouteUpdateNow(types, groupKey, excludePeerId, opts = {}) {
+    const forceFull = !!opts.forceFull;
     if (groupKey !== undefined) {
       const peers = this._getPeersMap(groupKey, false);
       if (!peers) return;
@@ -431,6 +478,7 @@ export class PeerManager {
     }
     session.mySessionId = ws.serverSessionId;
     const forceFullLocal = forceFull || !session.dstSessionId;
+    const nextPeerInfoVersions = new Map();
 
     const allPeers = new Set(this.listPeerIdsInGroup(groupKey));
     const infos = this._getPeerInfosMap(groupKey, false);
@@ -450,17 +498,18 @@ export class PeerManager {
         : (this._getPeerInfosMap(groupKey, false)?.get(pid));
       if (!info) {
         info = makeStubPeerInfo(pid, defaultNetLen);
-        this._getPeerInfosMap(groupKey, true).set(pid, info);
+        this.updatePeerInfo(groupKey, pid, info);
       }
       const version = info && info.version ? info.version : 1;
       const prev = forceFullLocal ? 0 : (session.peerInfoVerMap.get(pid) || 0);
       if (forceFullLocal || version > prev) {
         peerInfosItems.push(info);
-        session.peerInfoVerMap.set(pid, version);
+        nextPeerInfoVersions.set(pid, version);
       }
     }
 
     let connBitmap = null;
+    let nextBitmapSig = session.lastConnBitmapSig;
     if (relevantPeers.length > 0) {
       const connVersions = this._getPeerConnVersionMap(groupKey, true);
       const peerIdVersions = relevantPeers.map((pid) => {
@@ -496,12 +545,13 @@ export class PeerManager {
         }
       }
       const bitmapBuf = Buffer.from(bitmap);
-      const sig = `${peerIdVersions.map(p => `${p.peerId}:${p.version}`).join(',')}|${bitmapBuf.toString('hex')}`;
+      const sig = sha256().update(peerIdVersions.map(p => `${p.peerId}:${p.version}`).join(','))
+        .update(bitmapBuf).digest('hex');
       const connVersion = session.connBitmapVerMap.get(targetPeerId) || 0;
       const nextConnVersion = connVersion || Math.max(...peerIdVersions.map(p => p.version));
-      if (sig !== session.lastConnBitmapSig) {
+      if (forceFullLocal || sig !== session.lastConnBitmapSig) {
         session.connBitmapVerMap.set(targetPeerId, nextConnVersion);
-        session.lastConnBitmapSig = sig;
+        nextBitmapSig = sig;
         connBitmap = { peerIds: peerIdVersions, bitmap: bitmapBuf, version: nextConnVersion };
       }
     }
@@ -571,16 +621,10 @@ export class PeerManager {
     const rpcPacketBytes = t.RpcPacket.encode(rpcReqPacket).finish();
     try {
       ws.send(wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws));
+      for (const [pid, version] of nextPeerInfoVersions) session.peerInfoVerMap.set(pid, version);
+      session.lastConnBitmapSig = nextBitmapSig;
     } catch (e) {
       // ignore
     }
   }
-}
-
-let peerManagerInstance = null;
-export function getPeerManager() {
-  if (!peerManagerInstance) {
-    peerManagerInstance = new PeerManager();
-  }
-  return peerManagerInstance;
 }

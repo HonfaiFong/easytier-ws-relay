@@ -13,14 +13,14 @@
 - 基于 Cloudflare Workers 和 Durable Objects
 - 使用 WebSocket 协议进行实时通信
 - 采用 Protocol Buffers 进行高效序列化
-- 支持消息加密与完整性保护
+- 透传 EasyTier 客户端加密的数据（中继层不负责端到端加密）
 - 模块化设计，便于扩展和维护
 
 ## 开发环境搭建
 
 ### 前置要求
 
-- Node.js (>= 16.0.0)
+- Node.js (>= 22.0.0)
 - pnpm (推荐) 或 npm
 - Wrangler CLI (Cloudflare Workers 工具链)
 
@@ -79,11 +79,11 @@ wrangler deploy
 
 ### 配置说明
 
-项目使用 [wrangler.toml](file:///Users/runner/work/easytier/easytier/easytier-v3/easytier-ws-relay/wrangler.toml#L0-L0) 文件进行配置，主要配置项包括：
+项目使用 [wrangler.toml](./wrangler.toml) 文件进行配置，主要配置项包括：
 
-- [name](file:///Users/runner/work/easytier/easytier/easytier-v3/easytier/src/cli/main.rs#L0-L0): Worker 名称
-- [main](file:///Users/runner/work/easytier/easytier/easytier-v3/easytier/src/cli/main.rs#L0-L0): 入口文件路径
-- [compatibility_date](file:///Users/runner/work/easytier/easytier/easytier-v3/easytier/src/cli/main.rs#L0-L0): 兼容性日期
+- [name](./wrangler.toml): Worker 名称
+- [main](./wrangler.toml): 入口文件路径
+- [compatibility_date](./wrangler.toml): 兼容性日期
 - Durable Objects 配置
 - 环境变量配置
 
@@ -122,7 +122,7 @@ easytier-ws-relay/
 - WebSocket 双向通信中继
 - 基于 Room 的连接管理
 - 使用 Protobuf 进行高效序列化
-- 消息加密与完整性保护
+- 透传 EasyTier 客户端加密的数据（中继层不负责端到端加密）
 - 客户端状态管理与心跳维持
 - RPC 请求/响应处理机制
 
@@ -130,7 +130,7 @@ easytier-ws-relay/
 
 在 `wrangler.toml` 的 `[vars]` 中配置：
 - `EASYTIER_DISABLE_RELAY`: `"1"` 开启纯 P2P，默认 `"0"`
-- `EASYTIER_COMPRESS_RPC`: `"0"` 关闭 RPC 压缩（调试用），默认 `"1"`
+- RPC 仅支持未压缩报文，协商 `None`；收到 Zstd 会明确关闭连接，要求客户端改用未压缩 RPC。
 
 修改完配置后按正常方式运行 `wrangler dev` 或部署即可生效。
 
@@ -172,6 +172,53 @@ ws://your-network-ip:0/ws
 ```
 wss://your-deployment.workers.dev:0/ws
 ```
+
+## 接入、资源限制与测试
+
+通过 `room` 参数将网络稳定分配到不同房间，例如 `wss://your-deployment.workers.dev:0/ws?room=my-network`。不传参数时使用 `default` 房间；每个房间都有独立的节点、摘要注册和 RPC 状态。
+
+需要限制接入时，将 `EASYTIER_RELAY_TOKEN` 保存为 Cloudflare Secret：
+
+```bash
+pnpm exec wrangler secret put EASYTIER_RELAY_TOKEN
+```
+
+客户端可通过 `Authorization: Bearer <token>` 或 URL 参数 `token` 提交令牌，例如 `wss://your-deployment.workers.dev:0/ws?room=my-network&token=<URL编码后的令牌>`。请使用 WSS，并避免在日志中记录完整连接 URL。未配置 Secret 时为公共接入模式。这个共享令牌用于中继接入，不验证单个节点身份或 EasyTier 网络密钥所有权；网络摘要只用于分组和检查同名网络的一致性。
+
+握手后，报文来源 Peer ID 必须等于当前连接注册的 Peer ID；本地 RPC 内层 ID 和业务请求 ID 也会校验。当前支持直接连接的节点，经过其他节点转来的不同来源 ID 会被拒绝。重复 Peer ID 的新连接会被拒绝，旧连接进入关闭状态后才允许重连。
+
+`EASYTIER_DISABLE_RELAY="1"` 时仅转发 RPC、Ping 和 Pong 信令，丢弃 Data、KCP 和不透明的 ForeignNetworkPacket。默认 `"0"` 保留数据中继。纯 P2P 模式下不支持封装在 ForeignNetworkPacket 中的信令。
+
+RPC 仅协商 `None`，大响应也不会使用 Gzip。发给中继自身的 Zstd RPC、分片 RPC、加密或包级压缩控制报文会明确关闭连接，客户端必须使用未压缩的单片控制报文。节点之间的加密或压缩数据保持原样透传，原始长度与线上的载荷长度可以不同。
+
+可通过 Worker `env` 配置以下限制；非法值回退到默认值，超出上限的值会被截断：
+
+| 变量 | 默认值 | 上限 / 范围 |
+| --- | --- | --- |
+| `EASYTIER_MAX_CONNECTIONS` | 128 个连接 / 房间 | 不超过每组路由节点上限 |
+| `EASYTIER_MAX_ROUTE_PEERS` | 256 个节点 / 网络组 | 1024 |
+| `EASYTIER_MAX_TOTAL_ROUTE_PEERS` | 1024 条节点记录 / 房间 | 4096 |
+| `EASYTIER_MAX_PEER_INFO_BYTES` | 4096 字节 / 节点记录 | 16384 |
+| `EASYTIER_MAX_FRAME_BYTES` | 1048576 字节 / 入站帧 | 1048576 |
+| `EASYTIER_MAX_MESSAGES_PER_SECOND` | 1000 帧 / 连接 / 秒 | 10000 |
+| `EASYTIER_MAX_BYTES_PER_SECOND` | 8388608 字节 / 连接 / 秒 | 33554432 |
+| `EASYTIER_ROUTE_BROADCAST_INTERVAL_MS` | 100 毫秒 | 1–1000 |
+
+节点变更会合并广播，已确认会话使用增量 PeerInfo；连接矩阵变化时仍发送完整矩阵。连接元数据在握手和会话变更后保存到 WebSocket Attachment，休眠恢复会重建节点映射并使用新会话 ID 请求完整路由。旧版本缺失身份的 Attachment 会要求重连。
+
+```bash
+npm ci
+npm test
+npm exec wrangler deploy -- --dry-run
+```
+
+本地 workerd 冒烟验证（另开终端运行 `wrangler dev --ip 127.0.0.1 --port 18783`）：
+
+```bash
+npm run test:runtime
+```
+
+回归测试与验证边界见 [修复说明](./docs/review-fixes.md)。
 
 ## 贡献
 

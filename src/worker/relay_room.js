@@ -1,160 +1,167 @@
-import { Buffer } from 'buffer';
+import { Buffer } from 'node:buffer';
 import { parseHeader } from './core/packet.js';
 import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
 import { handleHandshake, handlePing, handleForwarding } from './core/basic_handlers.js';
 import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
-import { getPeerManager } from './core/peer_manager.js';
+import { PeerManager } from './core/peer_manager.js';
 import { randomU64String } from './core/crypto.js';
+import { authorizeRelay, positiveLimit } from './core/security.js';
+
+const VALID_PACKET_TYPES = new Set(Object.values(PacketType).filter(t => t !== PacketType.Invalid));
 
 function getWebSocketPath(env) {
-  const configuredPath = env && env.WS_PATH ? String(env.WS_PATH) : 'ws';
-  return configuredPath.startsWith('/') ? configuredPath : `/${configuredPath}`;
+  const path = String(env.WS_PATH || 'ws');
+  return path.startsWith('/') ? path : `/${path}`;
 }
 
 export class RelayRoom {
-  constructor(state, env) {
+  constructor(state, env = {}) {
     this.state = state;
     this.env = env;
     this.types = loadProtos();
-    this.peerManager = getPeerManager();
+    this.peerManager = new PeerManager(env);
     this.peerManager.setTypes(this.types);
-
-    // Keep runtime configuration in sync with Cloudflare Worker env bindings.
-    this.peerManager.applyRuntimeEnv?.(env);
-
-    // Restore sockets after hibernation to keep metadata.
-    this.state.getWebSockets().forEach((ws) => this._restoreSocket(ws));
+    this.maxConnections = positiveLimit(env, 'EASYTIER_MAX_CONNECTIONS', 128, this.peerManager.maxRoutePeers);
+    this.maxFrameBytes = positiveLimit(env, 'EASYTIER_MAX_FRAME_BYTES', 1024 * 1024);
+    this.maxMessagesPerSecond = positiveLimit(env, 'EASYTIER_MAX_MESSAGES_PER_SECOND', 1000, 10000);
+    this.maxBytesPerSecond = positiveLimit(env, 'EASYTIER_MAX_BYTES_PER_SECOND', 8 * 1024 * 1024, 32 * 1024 * 1024);
+    state.getWebSockets().forEach(ws => this._restoreSocket(ws));
   }
 
   async fetch(request) {
     const url = new URL(request.url);
     const wsPath = getWebSocketPath(this.env);
-    if (url.pathname !== wsPath && url.pathname !== wsPath + '/') {
-      return new Response('Not found', { status: 404 });
+    if (url.pathname !== wsPath && url.pathname !== wsPath + '/') return new Response('Not found', { status: 404 });
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return new Response('Expected websocket', { status: 400 });
+    if (!authorizeRelay(request, this.env)) return new Response('Unauthorized', { status: 401 });
+    if (this.state.getWebSockets().filter(ws => ws.readyState === 1).length >= this.maxConnections) {
+      return new Response('Room capacity exceeded', { status: 503 });
     }
-    if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response('Expected websocket', { status: 400 });
-    }
-
     const pair = new WebSocketPair();
-    const server = pair[1];
-    const client = pair[0];
-    await this.handleSession(server);
-
-    return new Response(null, { status: 101, webSocket: client });
+    await this.handleSession(pair[1]);
+    return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  async handleSession(webSocket) {
-    this.state.acceptWebSocket(webSocket);
-    this._initSocket(webSocket);
+  async handleSession(ws) {
+    this.state.acceptWebSocket(ws);
+    this._initSocket(ws);
   }
 
   async webSocketMessage(ws, message) {
+    if (ws.rejected) return;
     try {
-      let buffer = null;
-      if (message instanceof ArrayBuffer) {
-        buffer = Buffer.from(message);
-      } else if (message instanceof Uint8Array) {
-        buffer = Buffer.from(message);
-      } else if (ArrayBuffer.isView(message) && message.buffer) {
-        buffer = Buffer.from(message.buffer);
-      } else {
-        console.warn('[ws] unsupported message type', typeof message);
-        return;
-      }
-
-      console.log(`[ws] recv len=${buffer.length}`);
-      ws.lastSeen = Date.now();
+      let buffer;
+      if (message instanceof ArrayBuffer) buffer = Buffer.from(message);
+      else if (ArrayBuffer.isView(message)) buffer = Buffer.from(message.buffer, message.byteOffset, message.byteLength);
+      else return this.rejectSocket(ws, 1003, 'Binary packets required');
+      if (buffer.length > this.maxFrameBytes) return this.rejectSocket(ws, 1009, 'Frame too large');
       const header = parseHeader(buffer);
-      if (!header) {
-        console.error('[ws] parseHeader failed, raw hex=', buffer.toString('hex'));
+      if (!header || !VALID_PACKET_TYPES.has(header.packetType)) return this.rejectSocket(ws, 1002, 'Invalid header');
+      // Encryption adds a trailer; compression retains the original length in the header.
+      const opaquePayload = (header.flags & 0x11) !== 0;
+      if (header.len > this.maxFrameBytes - HEADER_SIZE ||
+          (!opaquePayload && header.len !== buffer.length - HEADER_SIZE) ||
+          (opaquePayload && buffer.length === HEADER_SIZE)) {
+        return this.rejectSocket(ws, 1002, 'Invalid packet length');
+      }
+      const forServer = header.toPeerId === MY_PEER_ID || header.toPeerId === 0;
+      if (opaquePayload && (header.packetType === PacketType.HandShake || forServer)) {
+        return this.rejectSocket(ws, 1003, 'Encoded control packets unsupported');
+      }
+      const now = Date.now();
+      if (now - ws.rateWindowStart >= 1000) {
+        ws.rateWindowStart = now;
+        ws.rateWindowCount = 0;
+        ws.rateWindowBytes = 0;
+      }
+      if (++ws.rateWindowCount > this.maxMessagesPerSecond) return this.rejectSocket(ws, 1008, 'Message rate exceeded');
+      ws.rateWindowBytes += buffer.length;
+      if (ws.rateWindowBytes > this.maxBytesPerSecond) return this.rejectSocket(ws, 1008, 'Byte rate exceeded');
+      ws.lastSeen = now;
+      if (header.packetType === PacketType.HandShake) {
+        handleHandshake(ws, header, buffer.subarray(HEADER_SIZE), this.types, this);
         return;
       }
-
-      console.log(`[ws] header from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
-      const payload = buffer.subarray(HEADER_SIZE);
-
-      switch (header.packetType) {
-        case PacketType.HandShake:
-          console.log(`[ws] -> handleHandshake payload hex=${payload.toString('hex')}`);
-          handleHandshake(ws, header, payload, this.types);
-          break;
-
-        case PacketType.Ping:
-          handlePing(ws, header, payload);
-          break;
-
-        case PacketType.RpcReq:
-          if (header.toPeerId === MY_PEER_ID || header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === 0) {
-            handleRpcReq(ws, header, payload, this.types);
-          } else {
-            console.log(`[ws] -> forward RpcReq from=${header.fromPeerId} to=${header.toPeerId} len=${payload.length}`);
-            handleForwarding(ws, header, buffer, this.types);
-          }
-          break;
-
-        case PacketType.RpcResp:
-          if (header.toPeerId === MY_PEER_ID || header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === 0) {
-            handleRpcResp(ws, header, payload, this.types);
-          } else {
-            console.log(`[ws] -> forward RpcResp from=${header.fromPeerId} to=${header.toPeerId} len=${payload.length}`);
-            handleForwarding(ws, header, buffer, this.types);
-          }
-          break;
-
-        case PacketType.Data:
-        default:
-          if (header.packetType !== PacketType.Data) {
-            console.log(`[ws] -> forward type=${header.packetType} len=${payload.length}`);
-          }
-          handleForwarding(ws, header, buffer, this.types);
-          break;
+      if (!ws.handshakeComplete || header.fromPeerId !== ws.peerId ||
+          this.peerManager.getPeerWs(ws.peerId, ws.groupKey) !== ws) {
+        return this.rejectSocket(ws, 1008, 'Unauthorized peer');
       }
+      if (ws.routeResyncPending) {
+        ws.routeResyncPending = false;
+        this.peerManager.pushRouteUpdateTo(ws.peerId, ws, this.types, { forceFull: true });
+      }
+      const payload = buffer.subarray(HEADER_SIZE);
+      if (header.packetType === PacketType.Ping && forServer) handlePing(ws, header, payload);
+      else if (header.packetType === PacketType.RpcReq && forServer) handleRpcReq(ws, header, payload, this.types, this);
+      else if (header.packetType === PacketType.RpcResp && forServer) handleRpcResp(ws, header, payload, this.types, this);
+      else handleForwarding(ws, header, buffer, this.types, this);
     } catch (e) {
-      console.error('relay_room message handling error:', e);
-      try { ws.close(1011, 'internal error'); } catch (_) { }
+      console.warn('Packet rejected:', e.message);
+      this.rejectSocket(ws, 1002, 'Invalid packet');
     }
+  }
+
+  rejectSocket(ws, code, reason) {
+    ws.rejected = true;
+    ws.handshakeComplete = false;
+    this.saveSocketMeta(ws);
+    this.webSocketClose(ws);
+    try { ws.close(code, reason); } catch (_) { }
   }
 
   async webSocketClose(ws) {
-    if (ws.peerId) {
-      const groupKey = ws.groupKey;
-      const removed = this.peerManager.removePeer(ws);
-      if (removed) {
-        try {
-          this.peerManager.broadcastRouteUpdate(this.types, groupKey);
-        } catch (_) { }
-      }
-    }
+    if (this.peerManager.removePeer(ws)) this.peerManager.broadcastRouteUpdate(this.types, ws.groupKey);
   }
 
   async webSocketError(ws) {
-    await this.webSocketClose(ws);
+    this.rejectSocket(ws, 1011, 'WebSocket error');
   }
 
-  _initSocket(ws, meta = {}) {
-    ws.peerId = meta.peerId || null;
-    ws.groupKey = meta.groupKey || null;
-    ws.domainName = meta.domainName || null;
-    ws.lastSeen = Date.now();
-    ws.serverSessionId = meta.serverSessionId || randomU64String();
-    ws.weAreInitiator = false;
-    ws.crypto = { enabled: false };
-    ws.serializeAttachment?.({
-      peerId: ws.peerId,
-      groupKey: ws.groupKey,
-      domainName: ws.domainName,
-      serverSessionId: ws.serverSessionId,
+  saveSocketMeta(ws) {
+    ws.serializeAttachment({
+      schemaVersion: 1,
+      peerId: ws.peerId, groupKey: ws.groupKey, domainName: ws.domainName,
+      networkDigestHex: ws.networkDigestHex,
+      handshakeComplete: ws.handshakeComplete, rejected: ws.rejected,
+      serverSessionId: ws.serverSessionId, weAreInitiator: ws.weAreInitiator,
     });
   }
 
-  _restoreSocket(ws) {
-    const meta = ws.deserializeAttachment ? (ws.deserializeAttachment() || {}) : {};
-    this._initSocket(ws, meta);
+  _initSocket(ws, meta = {}) {
+    ws.peerId = meta.peerId ?? null;
+    ws.groupKey = meta.groupKey ?? null;
+    ws.domainName = meta.domainName ?? null;
+    ws.networkDigestHex = meta.networkDigestHex ?? null;
+    ws.handshakeComplete = meta.handshakeComplete === true;
+    ws.rejected = meta.rejected === true;
+    ws.lastSeen = Date.now();
+    ws.rateWindowStart = ws.lastSeen;
+    ws.rateWindowCount = 0;
+    ws.rateWindowBytes = 0;
+    ws.serverSessionId = meta.serverSessionId || randomU64String();
+    ws.weAreInitiator = meta.weAreInitiator === true;
+    ws.crypto = { enabled: false };
+    this.saveSocketMeta(ws);
+  }
 
-    if (ws.peerId && ws.groupKey) {
-      this.peerManager.addPeer(ws.peerId, ws);
+  _restoreSocket(ws) {
+    if (ws.readyState !== 1) return;
+    const meta = ws.deserializeAttachment() || {};
+    this._initSocket(ws, meta);
+    if (meta.schemaVersion === 1 && !ws.handshakeComplete && !ws.rejected && !ws.peerId) return;
+    if (ws.rejected || !ws.handshakeComplete || !ws.peerId || !ws.groupKey) {
+      this.rejectSocket(ws, 1008, 'Reconnect required');
+      return;
     }
+    if (!this.peerManager.addPeer(ws.peerId, ws)) {
+      this.rejectSocket(ws, 1008, 'Duplicate peer ID');
+      return;
+    }
+    this.peerManager.networkDigestRegistry.set(ws.domainName, ws.networkDigestHex);
+    // Session caches were evicted. A new ID forces clients to send their full routes.
+    ws.serverSessionId = randomU64String();
+    ws.routeResyncPending = true;
+    this.saveSocketMeta(ws);
   }
 }

@@ -1,6 +1,5 @@
 # Dependencies
 node_modules/
-pnpm-lock.yaml
 
 # Environment variables
 .env
@@ -16,6 +15,7 @@ target/
 # Cloudflare Workers
 .wrangler/
 .cloudflare/
+.codegraph/
 
 # IDE files
 .vscode/

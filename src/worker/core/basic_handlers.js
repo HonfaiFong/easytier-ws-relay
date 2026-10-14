@@ -1,126 +1,86 @@
+import { Buffer } from 'node:buffer';
 import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
-import { getPeerManager } from './peer_manager.js';
-import { wrapPacket, randomU64String } from './crypto.js';
+import { wrapPacket } from './crypto.js';
 
-const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
+const WS_OPEN = 1;
+const P2P_SIGNAL_TYPES = new Set([PacketType.RpcReq, PacketType.RpcResp, PacketType.Ping, PacketType.Pong]);
 
-// Record the first registered digest per network name; later mismatched digest will be rejected
-const networkDigestRegistry = new Map();
-
-export function handleHandshake(ws, header, payload, types) {
+export function handleHandshake(ws, header, payload, types, room) {
   try {
     const req = types.HandshakeRequest.decode(payload);
-    try {
-      const dig = req.networkSecretDigrest ? Buffer.from(req.networkSecretDigrest) : Buffer.alloc(0);
-      console.log(`Handshake networkSecretDigest(hex)=${dig.toString('hex')}`);
-    } catch (_) {
-      // ignore
-    }
-
-    if (req.magic !== MAGIC) {
-      console.error('Invalid magic');
-      ws.close();
-      return;
-    }
-
+    const pm = room.peerManager;
     const clientNetworkName = req.networkName || '';
-    const clientDigest = req.networkSecretDigrest ? Buffer.from(req.networkSecretDigrest) : Buffer.alloc(0);
-    const digestHex = clientDigest.toString('hex');
-    const existingDigest = networkDigestRegistry.get(clientNetworkName);
-    if (existingDigest && existingDigest !== digestHex) {
-      console.error(`Rejecting handshake from ${req.myPeerId}: digest mismatch for network "${clientNetworkName}" (existing=${existingDigest}, incoming=${digestHex})`);
-      ws.close();
+    const clientDigest = Buffer.from(req.networkSecretDigrest || []);
+    if (ws.handshakeComplete || req.magic !== MAGIC || !req.myPeerId ||
+        req.myPeerId === MY_PEER_ID || req.myPeerId !== header.fromPeerId ||
+        clientNetworkName.length > 128 || ![0, 32].includes(clientDigest.length)) {
+      room.rejectSocket(ws, 1008, 'Invalid handshake');
       return;
     }
-    if (!existingDigest) {
-      networkDigestRegistry.set(clientNetworkName, digestHex);
+    const digestHex = clientDigest.toString('hex');
+    if (pm.networkDigestRegistry.has(clientNetworkName) &&
+        pm.networkDigestRegistry.get(clientNetworkName) !== digestHex) {
+      room.rejectSocket(ws, 1008, 'Network digest mismatch');
+      return;
     }
-    const groupDigest = networkDigestRegistry.get(clientNetworkName) || '';
-    const groupKey = `${clientNetworkName}:${groupDigest}`;
-    const serverNetworkName = process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'public_server';
-    const digest = new Uint8Array(32);
-
+    // A digest partitions networks; it does not prove possession of a network secret.
+    const groupKey = `${clientNetworkName}:${digestHex}`;
+    if (pm.getPeerWs(req.myPeerId, groupKey)?.readyState === WS_OPEN) {
+      room.rejectSocket(ws, 1008, 'Duplicate peer ID');
+      return;
+    }
+    if (!pm._getPeerInfosMap(groupKey, false)?.has(req.myPeerId) &&
+        (pm._getPeerInfosMap(groupKey, false)?.size || 0) >= pm.maxRoutePeers) {
+      room.rejectSocket(ws, 1008, 'Route peer limit exceeded');
+      return;
+    }
     ws.domainName = clientNetworkName;
-
-    const respPayload = {
-      magic: MAGIC,
-      myPeerId: MY_PEER_ID,
-      version: VERSION,
-      features: ["node-server-v1"],
-      networkName: serverNetworkName,
-      networkSecretDigrest: digest
-    };
-
+    ws.networkDigestHex = digestHex;
     ws.groupKey = groupKey;
     ws.peerId = req.myPeerId;
-    const pm = getPeerManager();
-    pm.addPeer(req.myPeerId, ws);
-    pm.updatePeerInfo(ws.groupKey, req.myPeerId, {
-      peerId: req.myPeerId,
-      version: 1,
+    if (!pm.addPeer(req.myPeerId, ws)) {
+      room.rejectSocket(ws, 1008, 'Duplicate peer ID');
+      return;
+    }
+    pm.networkDigestRegistry.set(clientNetworkName, digestHex);
+    pm.updatePeerInfo(groupKey, req.myPeerId, {
+      peerId: req.myPeerId, version: 1,
       lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
       instId: { part1: 0, part2: 0, part3: 0, part4: 0 },
-      networkLength: Number(process.env.EASYTIER_NETWORK_LENGTH || 24),
+      networkLength: Number(pm.getEnv('EASYTIER_NETWORK_LENGTH', 24)),
     });
-    pm.setPublicServerFlag(true);
-    ws.crypto = { enabled: false };
-
-    const respBuffer = types.HandshakeRequest.encode(respPayload).finish();
-    const respHeader = createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length);
-    ws.send(Buffer.concat([respHeader, Buffer.from(respBuffer)]));
-    if (!ws.serverSessionId) {
-      ws.serverSessionId = randomU64String();
-    }
-    if (ws.weAreInitiator === undefined) {
-      ws.weAreInitiator = false;
-    }
-
-    setTimeout(() => {
-      try {
-        if (ws.readyState === WS_OPEN) {
-          const pm = getPeerManager();
-          pm.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
-          pm.broadcastRouteUpdate(types, ws.groupKey, req.myPeerId, { forceFull: true });
-        }
-      } catch (e) {
-        console.error(`Failed to push initial route update to ${req.myPeerId}:`, e.message);
-      }
-    }, 50);
-
+    ws.handshakeComplete = true;
+    room.saveSocketMeta(ws);
+    const respBuffer = types.HandshakeRequest.encode({
+      magic: MAGIC, myPeerId: MY_PEER_ID, version: VERSION,
+      features: ['node-server-v1'],
+      networkName: pm.getEnv('EASYTIER_PUBLIC_SERVER_NETWORK_NAME', 'public_server'),
+      networkSecretDigrest: new Uint8Array(32),
+    }).finish();
+    ws.send(Buffer.concat([createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length), Buffer.from(respBuffer)]));
+    pm.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
+    pm.broadcastRouteUpdate(types, groupKey, req.myPeerId);
   } catch (e) {
-    console.error('Handshake error:', e);
-    ws.close();
+    console.warn('Handshake rejected:', e.message);
+    room.rejectSocket(ws, 1008, 'Invalid handshake');
   }
 }
 
 export function handlePing(ws, header, payload) {
-  const msg = wrapPacket(createHeader, MY_PEER_ID, header.fromPeerId, PacketType.Pong, payload, ws);
-  ws.send(msg);
+  ws.send(wrapPacket(createHeader, MY_PEER_ID, header.fromPeerId, PacketType.Pong, payload, ws));
 }
 
-export function handleForwarding(sourceWs, header, fullMessage, types) {
-  const targetPeerId = header.toPeerId;
-  const pm = getPeerManager();
-  const targetWs = pm.getPeerWs(targetPeerId, sourceWs && sourceWs.groupKey);
-
-  if (targetWs && targetWs.readyState === WS_OPEN) {
-    const srcGroup = sourceWs && sourceWs.groupKey;
-    const dstGroup = targetWs && targetWs.groupKey;
-    if (srcGroup && dstGroup && srcGroup !== dstGroup) {
-      return;
-    }
-    try {
-      targetWs.send(fullMessage);
-    } catch (e) {
-      console.error(`Forward to ${targetPeerId} failed: ${e.message}`);
-      pm.removePeer(targetWs);
-      try {
-        pm.broadcastRouteUpdate(types, srcGroup);
-      } catch (err) {
-        console.error(`Broadcast after forward failure failed: ${err.message}`);
-      }
-    }
-  } else {
+export function handleForwarding(sourceWs, header, fullMessage, types, room) {
+  const pm = room.peerManager;
+  // Only control traffic passes in pure P2P mode, including no opaque foreign/KCP data.
+  if (pm.isPureP2PMode() && !P2P_SIGNAL_TYPES.has(header.packetType)) return;
+  const targetWs = pm.getPeerWs(header.toPeerId, sourceWs.groupKey);
+  if (!targetWs || targetWs.readyState !== WS_OPEN || targetWs.groupKey !== sourceWs.groupKey) return;
+  try {
+    targetWs.send(fullMessage);
+  } catch (e) {
+    console.warn('Forward failed:', e.message);
+    room.rejectSocket(targetWs, 1011, 'Forward failed');
   }
 }

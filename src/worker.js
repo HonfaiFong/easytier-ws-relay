@@ -1,6 +1,7 @@
 // Cloudflare Worker entry for EasyTier WebSocket relay backed by Durable Object
 // Module syntax is required for Durable Objects.
-import { RelayRoom } from './worker/relay_room';
+import { RelayRoom } from './worker/relay_room.js';
+import { authorizeRelay } from './worker/core/security.js';
 
 export { RelayRoom };
 
@@ -20,11 +21,18 @@ export default {
 
     const wsPath = getWebSocketPath(env);
     if (pathname === wsPath || pathname === wsPath + '/') {
-      if (request.headers.get('Upgrade') !== 'websocket') {
+      if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
         return new Response('Expected WebSocket upgrade', { status: 400 });
       }
 
+      if (!authorizeRelay(request, env)) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+
       const roomId = searchParams.get('room') || 'default';
+      if (roomId.length > 128) {
+        return new Response('Invalid room', { status: 400 });
+      }
       const options = env.LOCATION_HINT ? { locationHint: env.LOCATION_HINT } : {};
       const roomStub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId), options);
       return roomStub.fetch(request);

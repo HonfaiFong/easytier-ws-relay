@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { HEADER_SIZE } from './constants.js';
 
 export function parseHeader(buffer) {
